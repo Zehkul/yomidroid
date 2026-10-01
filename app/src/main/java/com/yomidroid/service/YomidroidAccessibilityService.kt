@@ -570,8 +570,8 @@ class YomidroidAccessibilityService : AccessibilityService() {
         val density = resources.displayMetrics.density
         val defaultW = (220 * density).toInt()
         val defaultH = (100 * density).toInt()
-        val savedW = selectionPrefs.getInt("w", defaultW).coerceIn(80, screenWidth.coerceAtLeast(80))
-        val savedH = selectionPrefs.getInt("h", defaultH).coerceIn(80, screenHeight.coerceAtLeast(80))
+        val savedW = selectionPrefs.getInt("w", defaultW).coerceIn(40, screenWidth.coerceAtLeast(40))
+        val savedH = selectionPrefs.getInt("h", defaultH).coerceIn(40, screenHeight.coerceAtLeast(40))
         val savedX = selectionPrefs.getInt("x", (screenWidth - savedW) / 2)
             .coerceIn(0, (screenWidth - savedW).coerceAtLeast(0))
         val savedY = selectionPrefs.getInt("y", screenHeight / 4)
@@ -595,8 +595,8 @@ class YomidroidAccessibilityService : AccessibilityService() {
                 val p = selectionParams ?: return
                 val oldW = p.width
                 val oldH = p.height
-                val w = newWidth.coerceIn(80, screenWidth.coerceAtLeast(80))
-                val h = newHeight.coerceIn(80, screenHeight.coerceAtLeast(80))
+                val w = newWidth.coerceIn(40, screenWidth.coerceAtLeast(40))
+                val h = newHeight.coerceIn(40, screenHeight.coerceAtLeast(40))
                 if (!anchorLeft) {
                     p.x = (p.x + (oldW - w)).coerceIn(0, (screenWidth - w).coerceAtLeast(0))
                 }

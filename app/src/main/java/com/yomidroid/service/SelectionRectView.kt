@@ -51,7 +51,7 @@ class SelectionRectView @JvmOverloads constructor(
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
     private val handleSize = 28f * density
     private val borderWidth = 3f * density
-    private val minSize = (80f * density).toInt()
+    private val minSize = (40f * density).toInt()
 
     private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -83,6 +83,10 @@ class SelectionRectView @JvmOverloads constructor(
     private var mode = Mode.NONE
     private var lastX = 0f
     private var lastY = 0f
+    private var gestureStartW = 0
+    private var gestureStartH = 0
+    private var gestureStartRawX = 0f
+    private var gestureStartRawY = 0f
     private var downX = 0f
     private var downY = 0f
     private var moved = false
@@ -135,6 +139,10 @@ class SelectionRectView @JvmOverloads constructor(
                 downY = event.rawY
                 lastX = event.rawX
                 lastY = event.rawY
+                gestureStartW = width
+                gestureStartH = height
+                gestureStartRawX = event.rawX
+                gestureStartRawY = event.rawY
                 moved = false
                 longPressTriggered = false
                 mode = hitTest(event.x, event.y)
@@ -151,10 +159,20 @@ class SelectionRectView @JvmOverloads constructor(
                 if (moved && !longPressTriggered) {
                     when (mode) {
                         Mode.MOVE -> listener?.onMove(dx, dy)
-                        Mode.RESIZE_TL -> applyResize(dx, dy, anchorLeft = false, anchorTop = false)
-                        Mode.RESIZE_TR -> applyResize(dx, dy, anchorLeft = true, anchorTop = false)
-                        Mode.RESIZE_BL -> applyResize(dx, dy, anchorLeft = false, anchorTop = true)
-                        Mode.RESIZE_BR -> applyResize(dx, dy, anchorLeft = true, anchorTop = true)
+                        // Resize from gesture-start geometry so min-size clamping does
+                        // not desync the edge from the finger when reversing direction.
+                        Mode.RESIZE_TL -> applyResizeAbsolute(
+                            event.rawX, event.rawY, anchorLeft = false, anchorTop = false
+                        )
+                        Mode.RESIZE_TR -> applyResizeAbsolute(
+                            event.rawX, event.rawY, anchorLeft = true, anchorTop = false
+                        )
+                        Mode.RESIZE_BL -> applyResizeAbsolute(
+                            event.rawX, event.rawY, anchorLeft = false, anchorTop = true
+                        )
+                        Mode.RESIZE_BR -> applyResizeAbsolute(
+                            event.rawX, event.rawY, anchorLeft = true, anchorTop = true
+                        )
                         Mode.NONE -> {}
                     }
                 }
@@ -195,20 +213,30 @@ class SelectionRectView @JvmOverloads constructor(
         return Mode.MOVE
     }
 
-    private fun applyResize(dx: Float, dy: Float, anchorLeft: Boolean, anchorTop: Boolean) {
-        var newW = width
-        var newH = height
-        if (anchorLeft) {
-            // right edge moves
-            newW = max(minSize, (width + dx).toInt())
+    /**
+     * Resize from the geometry at gesture start plus total finger delta.
+     * Clamping to [minSize] still applies, but reversing direction immediately
+     * tracks the finger again (no stuck offset from incremental clamp).
+     */
+    private fun applyResizeAbsolute(
+        rawX: Float,
+        rawY: Float,
+        anchorLeft: Boolean,
+        anchorTop: Boolean
+    ) {
+        val totalDx = rawX - gestureStartRawX
+        val totalDy = rawY - gestureStartRawY
+        val newW = if (anchorLeft) {
+            // right edge follows the finger
+            max(minSize, (gestureStartW + totalDx).toInt())
         } else {
-            // left edge moves — width shrinks when dragging right
-            newW = max(minSize, (width - dx).toInt())
+            // left edge follows the finger
+            max(minSize, (gestureStartW - totalDx).toInt())
         }
-        if (anchorTop) {
-            newH = max(minSize, (height + dy).toInt())
+        val newH = if (anchorTop) {
+            max(minSize, (gestureStartH + totalDy).toInt())
         } else {
-            newH = max(minSize, (height - dy).toInt())
+            max(minSize, (gestureStartH - totalDy).toInt())
         }
         listener?.onResize(newW, newH, anchorLeft, anchorTop)
     }
