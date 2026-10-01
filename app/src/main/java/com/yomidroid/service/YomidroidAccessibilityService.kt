@@ -610,6 +610,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
             savedH,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             android.graphics.PixelFormat.TRANSLUCENT
@@ -637,7 +638,9 @@ class YomidroidAccessibilityService : AccessibilityService() {
             captureSelectionAndOcr()
         }
         selectionScanRunnable = r
-        handler.post(r)
+        // Short settle delay avoids a storm of overlapping OCR + overlay windows
+        // while the user is still adjusting the rectangle.
+        handler.postDelayed(r, 150L)
     }
 
     private fun hideSelectionRect() {
@@ -667,6 +670,8 @@ class YomidroidAccessibilityService : AccessibilityService() {
      * manga-ocr directly on that crop (no detector).
      */
     private fun captureSelectionAndOcr() {
+        // Drop any dictionary popup that is locking the screen.
+        dismissTextPanelPopup()
         val params = selectionParams ?: return
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             Toast.makeText(this, "Screenshot requires Android 11+", Toast.LENGTH_SHORT).show()
@@ -1324,11 +1329,23 @@ class YomidroidAccessibilityService : AccessibilityService() {
 
     private fun ensureTextPanelPopupHost() {
         if (textPanelPopupHost != null) return
-        val host = android.widget.FrameLayout(this)
+        val host = android.widget.FrameLayout(this).apply {
+            // Touches outside the dictionary WebView dismiss the popup and
+            // restore pass-through so the rest of the screen is usable again.
+            setOnTouchListener { _, event ->
+                if (event.action == android.view.MotionEvent.ACTION_DOWN) {
+                    dismissTextPanelPopup()
+                }
+                // Consume the outside tap so it doesn't fall into a half-broken state,
+                // then pass-through is restored for subsequent touches.
+                true
+            }
+        }
         val params = WindowManager.LayoutParams(
             screenWidth,
             screenHeight,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            // Start pass-through: the host only becomes touchable while a popup is open.
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
@@ -1345,7 +1362,30 @@ class YomidroidAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** Full-screen host must not eat touches when no dictionary popup is visible. */
+    private fun setTextPanelPopupHostTouchable(touchable: Boolean) {
+        val host = textPanelPopupHost ?: return
+        val lp = host.layoutParams as? WindowManager.LayoutParams ?: return
+        val base = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        lp.flags = if (touchable) base else (base or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
+        try {
+            windowManager.updateViewLayout(host, lp)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update popup host flags: ${e.message}")
+        }
+    }
+
+    private fun dismissTextPanelPopup() {
+        try {
+            textPanelPopup?.hide()
+        } catch (_: Exception) {}
+        setTextPanelPopupHostTouchable(false)
+    }
+
     private fun hideTextPanel() {
+        dismissTextPanelPopup()
         textPanelPopup?.destroy()
         textPanelPopup = null
         textPanelPopupHost?.let { h ->
@@ -1385,18 +1425,8 @@ class YomidroidAccessibilityService : AccessibilityService() {
                     return@withContext
                 }
                 ensureTextPanelPopupHost()
-                // Host must be touchable while the popup is up
-                textPanelPopupHost?.let { host ->
-                    val lp = host.layoutParams as? WindowManager.LayoutParams
-                    if (lp != null) {
-                        lp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                        try {
-                            windowManager.updateViewLayout(host, lp)
-                        } catch (_: Exception) {}
-                    }
-                }
+                // Only now intercept touches (while the dictionary sheet is open).
+                setTextPanelPopupHostTouchable(true)
                 val host = textPanelPopupHost ?: return@withContext
                 val density = resources.displayMetrics.density
                 val panelY = textPanelParams?.y ?: (screenHeight - 120)
@@ -1426,6 +1456,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
                             }
                             withContext(Dispatchers.Main) {
                                 if (more.isNotEmpty()) {
+                                    setTextPanelPopupHostTouchable(true)
                                     popup.show(
                                         container = host,
                                         entries = more,
