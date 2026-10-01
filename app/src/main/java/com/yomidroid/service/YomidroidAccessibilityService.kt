@@ -2,7 +2,10 @@ package com.yomidroid.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.app.KeyguardManager
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.IntentFilter
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Bitmap
@@ -220,6 +223,30 @@ class YomidroidAccessibilityService : AccessibilityService() {
     private var currentForegroundPackage: String? = null
     private var currentForegroundAppLabel: String? = null
     private var currentWindowTitle: String? = null
+    /** True while lock screen or notification shade should suppress our overlays. */
+    private var systemUiHidingOverlays = false
+
+    private val systemUiReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF,
+                Intent.ACTION_CLOSE_SYSTEM_DIALOGS -> {
+                    // SCREEN_OFF: lock path. CLOSE_SYSTEM_DIALOGS fires for some
+                    // shade dismissals; we still re-evaluate below.
+                    if (intent.action == Intent.ACTION_SCREEN_OFF) {
+                        hideOverlaysForSystemUi("screen_off")
+                    } else {
+                        // Shade may have closed — restore if unlocked.
+                        handler.post { restoreOverlaysAfterSystemUi() }
+                    }
+                }
+                Intent.ACTION_USER_PRESENT,
+                Intent.ACTION_SCREEN_ON -> {
+                    handler.post { restoreOverlaysAfterSystemUi() }
+                }
+            }
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -270,8 +297,26 @@ class YomidroidAccessibilityService : AccessibilityService() {
                 "API=${Build.VERSION.SDK_INT}, " +
                 "joystickMode=${if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) "onMotionEvent" else "focusable-overlay"}")
 
-        // Create FAB
+        // Create FAB (or selection rect if Kaku mode)
         createFab()
+        updateFabVisibility()
+
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+            addAction(Intent.ACTION_CLOSE_SYSTEM_DIALOGS)
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(systemUiReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(systemUiReceiver, filter)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register system UI receiver: ${e.message}")
+        }
     }
 
     /**
@@ -375,8 +420,81 @@ class YomidroidAccessibilityService : AccessibilityService() {
         // different display than Yomidroid's overlay/UI).
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> refreshForegroundApp()
+            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
+                refreshForegroundApp()
+                evaluateSystemUiOverlayVisibility()
+            }
         }
+    }
+
+    /**
+     * Hide bubble/Kaku/dict/selection overlays while the keyguard or SystemUI
+     * shade (notification panel) is in front so they do not block the lock
+     * screen or the pull-down menu.
+     */
+    private fun evaluateSystemUiOverlayVisibility() {
+        val keyguard = getSystemService(KeyguardManager::class.java)
+        val locked = keyguard?.isKeyguardLocked == true
+        val shadeOrKeyguardWindow = isSystemUiForeground()
+        if (locked || shadeOrKeyguardWindow) {
+            hideOverlaysForSystemUi(if (locked) "keyguard" else "systemui")
+        } else if (systemUiHidingOverlays) {
+            restoreOverlaysAfterSystemUi()
+        }
+    }
+
+    private fun isSystemUiForeground(): Boolean {
+        val windowList: List<AccessibilityWindowInfo> = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val sparse = windowsOnAllDisplays
+                val merged = ArrayList<AccessibilityWindowInfo>()
+                for (i in 0 until sparse.size()) {
+                    sparse.valueAt(i)?.let { merged.addAll(it) }
+                }
+                merged
+            } else {
+                @Suppress("DEPRECATION")
+                windows ?: emptyList()
+            }
+        } catch (_: Exception) {
+            return false
+        }
+        return windowList.any { w ->
+            val pkg = try {
+                w.root?.packageName?.toString()
+            } catch (_: Exception) {
+                null
+            } ?: return@any false
+            if (pkg != "com.android.systemui") return@any false
+            // Active system UI panel / keyguard host.
+            w.isActive || w.type == AccessibilityWindowInfo.TYPE_SYSTEM
+        }
+    }
+
+    private fun hideOverlaysForSystemUi(reason: String) {
+        if (!systemUiHidingOverlays) {
+            Log.d(TAG, "Hiding overlays for system UI ($reason)")
+        }
+        systemUiHidingOverlays = true
+        hideTextPanel()
+        hideBubbleHitOverlay()
+        // Char-grid / standard OCR overlay
+        if (overlayContainer != null || overlayView != null) {
+            // removeOverlay also clears selection — avoid that path; clear char grid only.
+            clearCharGridOverlay()
+        }
+        selectionRectView?.visibility = View.GONE
+        fabView?.visibility = View.GONE
+    }
+
+    private fun restoreOverlaysAfterSystemUi() {
+        val keyguard = getSystemService(KeyguardManager::class.java)
+        if (keyguard?.isKeyguardLocked == true) return
+        if (isSystemUiForeground()) return
+        if (!systemUiHidingOverlays) return
+        systemUiHidingOverlays = false
+        Log.d(TAG, "Restoring overlays after system UI")
+        updateFabVisibility()
     }
 
     /**
@@ -457,6 +575,9 @@ class YomidroidAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        try {
+            unregisterReceiver(systemUiReceiver)
+        } catch (_: Exception) {}
         hideTextPanel()
         hideBubbleHitOverlay()
         hideSelectionRect()
