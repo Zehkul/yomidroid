@@ -59,6 +59,12 @@ data class OcrConfig(
     val mangaOcrMaxSideLen: Int = 2400,
     val mangaOcrPreprocess: Boolean = true,
     /**
+     * Manga OCR only. When true, FAB opens a Kaku-style movable selection
+     * rectangle and feeds that crop directly to manga-ocr (no detector).
+     * Default false keeps the vanilla full-screen detect → recognize path.
+     */
+    val mangaOcrSelectionRect: Boolean = false,
+    /**
      * Gemini Flash only. Run ML Kit in parallel and use its line bounding
      * boxes; replace ML Kit's text with Gemini's. Gives Gemini-quality
      * recognition with ML-Kit-quality bounds for cursor lookup.
@@ -90,6 +96,7 @@ class OcrConfigManager(context: Context) {
         private const val KEY_MANGA_OCR_CROP_SCALING = "manga_ocr_crop_scaling"
         private const val KEY_MANGA_OCR_MAX_SIDE_LEN = "manga_ocr_max_side_len"
         private const val KEY_MANGA_OCR_PREPROCESS = "manga_ocr_preprocess"
+        private const val KEY_MANGA_OCR_SELECTION_RECT = "manga_ocr_selection_rect"
         private const val KEY_GEMINI_USE_MLKIT_BOUNDS = "gemini_use_mlkit_bounds"
         private const val KEY_CROP_PRESET = "crop_preset"
         private const val KEY_CROP_LEFT = "crop_left"
@@ -125,6 +132,7 @@ class OcrConfigManager(context: Context) {
             mangaOcrCropScaling = cropScaling,
             mangaOcrMaxSideLen = prefs.getInt(KEY_MANGA_OCR_MAX_SIDE_LEN, 2400),
             mangaOcrPreprocess = prefs.getBoolean(KEY_MANGA_OCR_PREPROCESS, true),
+            mangaOcrSelectionRect = prefs.getBoolean(KEY_MANGA_OCR_SELECTION_RECT, false),
             geminiUseMlKitBounds = prefs.getBoolean(KEY_GEMINI_USE_MLKIT_BOUNDS, true),
             cropPreset = cropPreset,
             customCropLeft = prefs.getFloat(KEY_CROP_LEFT, 0f),
@@ -143,6 +151,7 @@ class OcrConfigManager(context: Context) {
             .putString(KEY_MANGA_OCR_CROP_SCALING, config.mangaOcrCropScaling.name)
             .putInt(KEY_MANGA_OCR_MAX_SIDE_LEN, config.mangaOcrMaxSideLen)
             .putBoolean(KEY_MANGA_OCR_PREPROCESS, config.mangaOcrPreprocess)
+            .putBoolean(KEY_MANGA_OCR_SELECTION_RECT, config.mangaOcrSelectionRect)
             .putBoolean(KEY_GEMINI_USE_MLKIT_BOUNDS, config.geminiUseMlKitBounds)
             .putString(KEY_CROP_PRESET, config.cropPreset.name)
             .putFloat(KEY_CROP_LEFT, config.customCropLeft)

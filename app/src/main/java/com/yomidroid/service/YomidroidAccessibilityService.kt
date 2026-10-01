@@ -523,7 +523,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
      */
     private fun usesSelectionRect(): Boolean {
         val cfg = ocrConfigManager?.getConfig() ?: return false
-        return cfg.selectedEngine == OcrEngineType.MANGA_OCR
+        return cfg.selectedEngine == OcrEngineType.MANGA_OCR && cfg.mangaOcrSelectionRect
     }
 
     private fun showSelectionRect() {

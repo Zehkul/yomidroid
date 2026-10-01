@@ -246,6 +246,15 @@ private fun MangaOcrTuningCard(
 
             Spacer(Modifier.height(16.dp))
             ToggleRow(
+                label = "Selection rectangle (Kaku-style)",
+                description = "FAB opens a movable/resizable box; double-tap feeds that " +
+                    "crop straight to manga-ocr (no detector). Off = vanilla full-screen OCR.",
+                checked = config.mangaOcrSelectionRect,
+                onChange = { onChange(config.copy(mangaOcrSelectionRect = it)) }
+            )
+
+            Spacer(Modifier.height(8.dp))
+            ToggleRow(
                 label = "Whole-bubble recognition",
                 description = "Cluster lines into bubbles. Faster + matches Manga109 training. " +
                     "Loses per-line tap precision in coupled mode.",
