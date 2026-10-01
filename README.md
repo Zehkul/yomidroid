@@ -65,6 +65,40 @@ Once at least one dictionary is loaded, lookups work end-to-end.
 - Android Studio Hedgehog (2023.1.1) or newer
 - JDK 17
 - Android SDK 34
+- Android NDK 26.1.10909125 (or the version referenced by the project)
+- CMake 3.22+
+
+### Clone with submodules
+
+Native code depends on **git submodules** (`llama.cpp` and `hoshidicts`). A plain
+clone leaves those directories empty and CMake fails with
+`does not contain a CMakeLists.txt file`.
+
+```bash
+git clone --recurse-submodules <repo-url>
+# or, if you already cloned:
+git submodule update --init --recursive
+```
+
+If the nested `hoshidicts/external/utf8proc` submodule fails because it uses an
+SSH URL (`git@github.com:...`) and you only have HTTPS access:
+
+```bash
+cd app/src/main/cpp/hoshidicts
+git config submodule.external/utf8proc.url https://github.com/JuliaStrings/utf8proc.git
+git submodule update --init --recursive
+cd -
+```
+
+Alternatively, rewrite SSH GitHub URLs to HTTPS globally for this machine:
+
+```bash
+git config --global url.https://github.com/.insteadOf git@github.com:
+git submodule update --init --recursive
+```
+
+You can also run `./scripts/init-submodules.sh`, which applies the utf8proc
+HTTPS rewrite and initializes all nested submodules.
 
 ### Build & Install
 
