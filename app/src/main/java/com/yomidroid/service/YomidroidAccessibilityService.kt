@@ -428,46 +428,18 @@ class YomidroidAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Hide bubble/Kaku/dict/selection overlays while the keyguard or SystemUI
-     * shade (notification panel) is in front so they do not block the lock
-     * screen or the pull-down menu.
+     * Only suppress overlays for the real lock screen (keyguard).
+     * Do NOT key off SystemUI windows — the status bar / nav bar / app
+     * chrome (e.g. Mihon reader UI) constantly create SystemUI activity
+     * and would hide the FAB/selection rect in normal use.
      */
     private fun evaluateSystemUiOverlayVisibility() {
         val keyguard = getSystemService(KeyguardManager::class.java)
         val locked = keyguard?.isKeyguardLocked == true
-        val shadeOrKeyguardWindow = isSystemUiForeground()
-        if (locked || shadeOrKeyguardWindow) {
-            hideOverlaysForSystemUi(if (locked) "keyguard" else "systemui")
+        if (locked) {
+            hideOverlaysForSystemUi("keyguard")
         } else if (systemUiHidingOverlays) {
             restoreOverlaysAfterSystemUi()
-        }
-    }
-
-    private fun isSystemUiForeground(): Boolean {
-        val windowList: List<AccessibilityWindowInfo> = try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                val sparse = windowsOnAllDisplays
-                val merged = ArrayList<AccessibilityWindowInfo>()
-                for (i in 0 until sparse.size()) {
-                    sparse.valueAt(i)?.let { merged.addAll(it) }
-                }
-                merged
-            } else {
-                @Suppress("DEPRECATION")
-                windows ?: emptyList()
-            }
-        } catch (_: Exception) {
-            return false
-        }
-        return windowList.any { w ->
-            val pkg = try {
-                w.root?.packageName?.toString()
-            } catch (_: Exception) {
-                null
-            } ?: return@any false
-            if (pkg != "com.android.systemui") return@any false
-            // Active system UI panel / keyguard host.
-            w.isActive || w.type == AccessibilityWindowInfo.TYPE_SYSTEM
         }
     }
 
@@ -490,7 +462,6 @@ class YomidroidAccessibilityService : AccessibilityService() {
     private fun restoreOverlaysAfterSystemUi() {
         val keyguard = getSystemService(KeyguardManager::class.java)
         if (keyguard?.isKeyguardLocked == true) return
-        if (isSystemUiForeground()) return
         if (!systemUiHidingOverlays) return
         systemUiHidingOverlays = false
         Log.d(TAG, "Restoring overlays after system UI")
@@ -691,7 +662,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
         val density = resources.displayMetrics.density
         val defaultW = (220 * density).toInt()
         val defaultH = (100 * density).toInt()
-        val savedW = selectionPrefs.getInt("w", defaultW).coerceIn(40, screenWidth.coerceAtLeast(40))
+        val savedW = selectionPrefs.getInt("w", defaultW).coerceIn(20, screenWidth.coerceAtLeast(20))
         val savedH = selectionPrefs.getInt("h", defaultH).coerceIn(40, screenHeight.coerceAtLeast(40))
         val savedX = selectionPrefs.getInt("x", (screenWidth - savedW) / 2)
             .coerceIn(0, (screenWidth - savedW).coerceAtLeast(0))
@@ -716,7 +687,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
                 val p = selectionParams ?: return
                 val oldW = p.width
                 val oldH = p.height
-                val w = newWidth.coerceIn(40, screenWidth.coerceAtLeast(40))
+                val w = newWidth.coerceIn(20, screenWidth.coerceAtLeast(20))
                 val h = newHeight.coerceIn(40, screenHeight.coerceAtLeast(40))
                 if (!anchorLeft) {
                     p.x = (p.x + (oldW - w)).coerceIn(0, (screenWidth - w).coerceAtLeast(0))

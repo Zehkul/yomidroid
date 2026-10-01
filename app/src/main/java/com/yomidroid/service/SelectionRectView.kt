@@ -40,7 +40,8 @@ class SelectionRectView @JvmOverloads constructor(
     private val resizeHit = 22f * density
     private val gripLen = 12f * density
     private val borderWidth = 2f * density
-    private val minSize = (40f * density).toInt()
+    private val minWidth = (20f * density).toInt()
+    private val minHeight = (40f * density).toInt()
 
     private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -169,8 +170,8 @@ class SelectionRectView @JvmOverloads constructor(
     private fun applyResizeAbsolute(rawX: Float, rawY: Float) {
         val totalDx = rawX - gestureStartRawX
         val totalDy = rawY - gestureStartRawY
-        val newW = max(minSize, (gestureStartW + totalDx).toInt())
-        val newH = max(minSize, (gestureStartH + totalDy).toInt())
+        val newW = max(minWidth, (gestureStartW + totalDx).toInt())
+        val newH = max(minHeight, (gestureStartH + totalDy).toInt())
         // Anchor top-left (left+top fixed).
         listener?.onResize(newW, newH, anchorLeft = true, anchorTop = true)
     }
