@@ -247,8 +247,8 @@ private fun MangaOcrTuningCard(
             Spacer(Modifier.height(16.dp))
             ToggleRow(
                 label = "Selection rectangle (Kaku-style)",
-                description = "FAB opens a movable/resizable box; double-tap feeds that " +
-                    "crop straight to manga-ocr (no detector). Off = vanilla full-screen OCR.",
+                description = "Persistent movable box; auto-scans after move/resize. Results " +
+                    "open as tappable text for word lookup (no fake glyph grid). Off = vanilla.",
                 checked = config.mangaOcrSelectionRect,
                 onChange = { onChange(config.copy(mangaOcrSelectionRect = it)) }
             )

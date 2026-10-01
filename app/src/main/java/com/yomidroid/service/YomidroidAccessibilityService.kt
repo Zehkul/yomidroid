@@ -110,6 +110,13 @@ class YomidroidAccessibilityService : AccessibilityService() {
     private val selectionPrefs by lazy {
         getSharedPreferences("selection_rect", Context.MODE_PRIVATE)
     }
+    // Text panel for manga-ocr selection / bubble results (no synthetic char boxes)
+    private var textPanelView: OcrTextSelectPanel? = null
+    private var textPanelParams: WindowManager.LayoutParams? = null
+    private var textPanelContainer: android.widget.FrameLayout? = null
+    private var textPanelPopup: OverlayPopupWebView? = null
+    private var selectionScanRunnable: Runnable? = null
+    private var selectionScanGeneration = 0
 
     // When true, FAB was hidden by TOGGLE_CURSOR and should stay hidden
     // until toggled back on or overlay is dismissed
@@ -422,6 +429,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        hideTextPanel()
         hideSelectionRect()
         super.onDestroy()
         Log.d(TAG, "Accessibility service destroyed")
@@ -575,12 +583,19 @@ class YomidroidAccessibilityService : AccessibilityService() {
                 }
             }
 
+            override fun onSettled() {
+                scheduleSelectionScan()
+            }
+
             override fun onConfirm() {
+                // Force immediate rescan (skip debounce)
+                selectionScanRunnable?.let { handler.removeCallbacks(it) }
                 captureSelectionAndOcr()
             }
 
             override fun onCancel() {
                 hideSelectionRect()
+                hideTextPanel()
                 Toast.makeText(this@YomidroidAccessibilityService, "Selection cancelled", Toast.LENGTH_SHORT).show()
             }
         }
@@ -608,7 +623,21 @@ class YomidroidAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun scheduleSelectionScan() {
+        selectionScanRunnable?.let { handler.removeCallbacks(it) }
+        val gen = ++selectionScanGeneration
+        val r = Runnable {
+            if (gen != selectionScanGeneration) return@Runnable
+            if (selectionRectView == null) return@Runnable
+            captureSelectionAndOcr()
+        }
+        selectionScanRunnable = r
+        handler.postDelayed(r, 400L)
+    }
+
     private fun hideSelectionRect() {
+        selectionScanRunnable?.let { handler.removeCallbacks(it) }
+        selectionScanRunnable = null
         selectionRectView?.let { v ->
             selectionParams?.let { p ->
                 selectionPrefs.edit()
@@ -710,7 +739,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
         }
 
         fullBitmap.recycle()
-        hideSelectionRect()
+        // Selection rect stays up (Kaku-style); only temporarily invisible during capture.
 
         val engine = ocrEngine
         if (engine !is MangaOcrEngine) {
@@ -737,14 +766,22 @@ class YomidroidAccessibilityService : AccessibilityService() {
             return
         }
 
+        // Restore selection rect (was hidden only for the screenshot)
+        selectionRectView?.visibility = View.VISIBLE
+        updateFabVisibility()
+
         serviceScope.launch {
             val result = engine.processDirectRegion(crop)
             withContext(Dispatchers.Main) {
                 result.fold(
                     onSuccess = { ocrResults ->
                         Log.d(TAG, "Direct manga-ocr success, ${ocrResults.size} results")
-                        if (ocrResults.isNotEmpty()) {
-                            showTextOverlay(ocrResults, crop, originalWidth, originalHeight, left, top)
+                        val text = ocrResults.joinToString("") { it.text }.trim()
+                        if (text.isNotEmpty()) {
+                            // Keep the selection rectangle up; show text for word picks
+                            // (manga-ocr has no per-glyph boxes).
+                            showTextPanel(text)
+                            crop.recycle()
                         } else {
                             Toast.makeText(this@YomidroidAccessibilityService, "No text found", Toast.LENGTH_SHORT).show()
                             crop.recycle()
@@ -877,6 +914,23 @@ class YomidroidAccessibilityService : AccessibilityService() {
                 result.fold(
                     onSuccess = { ocrResults ->
                         Log.d(TAG, "OCR success, found ${ocrResults.size} results")
+                        val cfgNow = ocrConfigManager?.getConfig()
+                        val bubbleManga = cfgNow?.selectedEngine == OcrEngineType.MANGA_OCR &&
+                            cfgNow.mangaOcrWholeBubbleMode
+                        if (bubbleManga && ocrResults.isNotEmpty()) {
+                            // Whole-bubble manga-ocr: no reliable glyph boxes → text panel.
+                            val text = ocrResults.joinToString("\n") { it.text }.trim()
+                            if (text.isNotEmpty()) {
+                                showTextPanel(text)
+                            } else {
+                                Toast.makeText(
+                                    this@YomidroidAccessibilityService,
+                                    "No text found",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                            return@fold
+                        }
                         val merged = mergeAdjacentLines(ocrResults)
                         if (merged.isNotEmpty()) {
                             showTextOverlay(merged, bitmapForOcr, originalWidth, originalHeight, cropOffsetX, cropOffsetY)
@@ -1123,6 +1177,149 @@ class YomidroidAccessibilityService : AccessibilityService() {
         }
     }
 
+
+    /**
+     * Kaku-style text panel: render OCR output as normal text and look up words
+     * by character index. Used for selection-rectangle and whole-bubble manga-ocr
+     * where synthetic glyph boxes are meaningless.
+     */
+    private fun showTextPanel(text: String) {
+        hideTextPanel()
+        // Clear char-grid overlay only — do NOT hide the Kaku selection rectangle.
+        clearCharGridOverlay()
+
+        val density = resources.displayMetrics.density
+        val panelHeight = (minOf(screenHeight * 0.28f, 220 * density)).toInt().coerceAtLeast(120)
+        val panelWidth = (screenWidth * 0.92f).toInt()
+        val panelX = ((screenWidth - panelWidth) / 2).coerceAtLeast(0)
+        // Sit just above the bottom edge so it does not cover the selection rect mid-screen
+        val panelY = (screenHeight - panelHeight - (48 * density).toInt()).coerceAtLeast(0)
+
+        val container = android.widget.FrameLayout(this)
+        val panel = OcrTextSelectPanel(this)
+        panel.setOcrText(text)
+        panel.listener = object : OcrTextSelectPanel.Listener {
+            override fun onCharTapped(t: String, charIndex: Int) {
+                lookupFromTextPanel(t, charIndex, container)
+            }
+            override fun onDismiss() {
+                hideTextPanel()
+            }
+        }
+        container.addView(
+            panel,
+            android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        val params = WindowManager.LayoutParams(
+            panelWidth,
+            panelHeight,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            android.graphics.PixelFormat.TRANSLUCENT
+        )
+        params.gravity = android.view.Gravity.TOP or android.view.Gravity.START
+        params.x = panelX
+        params.y = panelY
+
+        try {
+            windowManager.addView(container, params)
+            textPanelContainer = container
+            textPanelView = panel
+            textPanelParams = params
+            textPanelPopup = OverlayPopupWebView(this)
+            Log.d(TAG, "Text panel shown: ${text.take(40)}…")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to show text panel: ${e.message}", e)
+        }
+    }
+
+    private fun hideTextPanel() {
+        textPanelPopup?.destroy()
+        textPanelPopup = null
+        textPanelContainer?.let { c ->
+            try {
+                windowManager.removeView(c)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to remove text panel: ${e.message}")
+            }
+        }
+        textPanelContainer = null
+        textPanelView = null
+        textPanelParams = null
+    }
+
+    private fun lookupFromTextPanel(
+        text: String,
+        charIndex: Int,
+        container: android.widget.FrameLayout
+    ) {
+        if (charIndex < 0 || charIndex >= text.length) return
+        val searchText = text.substring(charIndex)
+        serviceScope.launch {
+            val entries = withContext(Dispatchers.IO) {
+                dictionaryEngineRef.get()?.findTerms(searchText) ?: emptyList()
+            }
+            withContext(Dispatchers.Main) {
+                if (entries.isEmpty()) {
+                    Toast.makeText(
+                        this@YomidroidAccessibilityService,
+                        "No dictionary entry",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    return@withContext
+                }
+                val density = resources.displayMetrics.density
+                val anchor = Rect(
+                    (screenWidth * 0.1f).toInt(),
+                    (textPanelParams?.y ?: 0) - (8 * density).toInt(),
+                    (screenWidth * 0.9f).toInt(),
+                    (textPanelParams?.y ?: 0)
+                )
+                val popup = textPanelPopup ?: OverlayPopupWebView(this@YomidroidAccessibilityService).also {
+                    textPanelPopup = it
+                }
+                popup.dictionaryCssMap = dictConfigManager?.getAllDictionaryCss() ?: emptyMap()
+                popup.show(
+                    container = container,
+                    entries = entries,
+                    textBounds = anchor,
+                    maxWidth = (screenWidth * 0.9f).toInt(),
+                    maxHeight = (screenHeight * 0.45f).toInt(),
+                    customCss = null,
+                    onAnkiExport = { entry, idx -> exportToAnki(entry, text, idx) },
+                    originalMatchedText = entries.firstOrNull()?.matchedText,
+                    onLookupTerm = { q ->
+                        serviceScope.launch {
+                            val more = withContext(Dispatchers.IO) {
+                                dictionaryEngineRef.get()?.findTerms(q) ?: emptyList()
+                            }
+                            withContext(Dispatchers.Main) {
+                                if (more.isNotEmpty()) {
+                                    popup.show(
+                                        container = container,
+                                        entries = more,
+                                        textBounds = anchor,
+                                        maxWidth = (screenWidth * 0.9f).toInt(),
+                                        maxHeight = (screenHeight * 0.45f).toInt(),
+                                        customCss = null,
+                                        onAnkiExport = { entry, idx -> exportToAnki(entry, text, idx) },
+                                        originalMatchedText = more.firstOrNull()?.matchedText
+                                    )
+                                }
+                            }
+                        }
+                    }
+                )
+            }
+        }
+    }
+
     private fun showTextOverlay(
         results: List<OcrResult>,
         screenshot: Bitmap,
@@ -1263,7 +1460,29 @@ class YomidroidAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** Remove the full-screen OCR char-grid overlay without touching the selection rect. */
+    private fun clearCharGridOverlay() {
+        overlayPopupWebView?.destroy()
+        overlayPopupWebView = null
+        overlayView?.let { it.onDismiss() }
+        overlayContainer?.let { container ->
+            try {
+                windowManager.removeView(container)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to remove overlay container: ${e.message}")
+            }
+        }
+        overlayContainer = null
+        overlayView = null
+        currentOcrResults = emptyList()
+        unifiedContext = null
+        currentScreenshot?.recycle()
+        currentScreenshot = null
+        charGrid = emptyList()
+    }
+
     private fun removeOverlay() {
+        hideTextPanel()
         hideSelectionRect()
         // Destroy WebView popup first
         overlayPopupWebView?.destroy()

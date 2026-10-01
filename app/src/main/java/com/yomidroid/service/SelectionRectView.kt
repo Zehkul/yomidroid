@@ -34,7 +34,12 @@ class SelectionRectView @JvmOverloads constructor(
         fun onMove(dx: Float, dy: Float)
         /** New width/height after a corner resize, in pixels. */
         fun onResize(newWidth: Int, newHeight: Int, anchorLeft: Boolean, anchorTop: Boolean)
-        /** User double-tapped to confirm the current rectangle. */
+        /**
+         * Gesture finished after a move or resize. Host should debounce and
+         * auto-scan (Kaku-style continuous selection).
+         */
+        fun onSettled()
+        /** User double-tapped to force an immediate rescan. */
         fun onConfirm()
         /** User long-pressed — optional dismiss / cancel. */
         fun onCancel()
@@ -159,13 +164,18 @@ class SelectionRectView @JvmOverloads constructor(
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 handler.removeCallbacks(longPressRunnable)
-                if (!moved && !longPressTriggered && event.actionMasked == MotionEvent.ACTION_UP) {
-                    val now = System.currentTimeMillis()
-                    if (now - lastTapTime < doubleTapMs) {
-                        lastTapTime = 0L
-                        listener?.onConfirm()
+                if (event.actionMasked == MotionEvent.ACTION_UP && !longPressTriggered) {
+                    if (moved) {
+                        // Kaku-style: rescan after the selection is repositioned.
+                        listener?.onSettled()
                     } else {
-                        lastTapTime = now
+                        val now = System.currentTimeMillis()
+                        if (now - lastTapTime < doubleTapMs) {
+                            lastTapTime = 0L
+                            listener?.onConfirm()
+                        } else {
+                            lastTapTime = now
+                        }
                     }
                 }
                 mode = Mode.NONE
