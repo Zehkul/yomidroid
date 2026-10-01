@@ -2,6 +2,7 @@ package com.yomidroid.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Bitmap
@@ -39,8 +40,10 @@ import com.yomidroid.config.InputConfigManager
 import com.yomidroid.config.OcrConfig
 import com.yomidroid.config.OcrConfigManager
 import com.yomidroid.ocr.CropCalculator
+import com.yomidroid.ocr.MangaOcrEngine
 import com.yomidroid.ocr.OcrEngine
 import com.yomidroid.ocr.OcrEngineFactory
+import com.yomidroid.config.OcrEngineType
 import com.yomidroid.anki.ExportResult
 import com.yomidroid.config.ColorConfig
 import com.yomidroid.config.ColorConfigManager
@@ -100,6 +103,13 @@ class YomidroidAccessibilityService : AccessibilityService() {
     private var overlayPopupWebView: OverlayPopupWebView? = null
     private var fabParams: WindowManager.LayoutParams? = null
     private var fabTouchListener: FabTouchListener? = null
+
+    // Kaku-style selection rectangle (used when Manga OCR is the active engine)
+    private var selectionRectView: SelectionRectView? = null
+    private var selectionParams: WindowManager.LayoutParams? = null
+    private val selectionPrefs by lazy {
+        getSharedPreferences("selection_rect", Context.MODE_PRIVATE)
+    }
 
     // When true, FAB was hidden by TOGGLE_CURSOR and should stay hidden
     // until toggled back on or overlay is dismissed
@@ -404,13 +414,15 @@ class YomidroidAccessibilityService : AccessibilityService() {
         // Update FAB position to stay on screen
         updateFabPositionForNewDimensions()
 
-        // Dismiss overlay if visible (coordinates won't match anymore)
+        // Dismiss overlay / selection if visible (coordinates won't match anymore)
         if (overlayView != null) {
             removeOverlay()
         }
+        hideSelectionRect()
     }
 
     override fun onDestroy() {
+        hideSelectionRect()
         super.onDestroy()
         Log.d(TAG, "Accessibility service destroyed")
         instance = null
@@ -502,6 +514,253 @@ class YomidroidAccessibilityService : AccessibilityService() {
             Log.d(TAG, "Updated FAB position for new dimensions: ${screenWidth}x${screenHeight}")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to update FAB position: ${e.message}")
+        }
+    }
+
+    /**
+     * Whether the active engine should use a user-moved selection rectangle
+     * (Kaku-style) instead of full-screen detect-then-recognize.
+     */
+    private fun usesSelectionRect(): Boolean {
+        val cfg = ocrConfigManager?.getConfig() ?: return false
+        return cfg.selectedEngine == OcrEngineType.MANGA_OCR
+    }
+
+    private fun showSelectionRect() {
+        if (selectionRectView != null) return
+        removeOverlay()
+
+        val density = resources.displayMetrics.density
+        val defaultW = (220 * density).toInt()
+        val defaultH = (100 * density).toInt()
+        val savedW = selectionPrefs.getInt("w", defaultW).coerceIn(80, screenWidth.coerceAtLeast(80))
+        val savedH = selectionPrefs.getInt("h", defaultH).coerceIn(80, screenHeight.coerceAtLeast(80))
+        val savedX = selectionPrefs.getInt("x", (screenWidth - savedW) / 2)
+            .coerceIn(0, (screenWidth - savedW).coerceAtLeast(0))
+        val savedY = selectionPrefs.getInt("y", screenHeight / 4)
+            .coerceIn(0, (screenHeight - savedH).coerceAtLeast(0))
+
+        val view = SelectionRectView(this)
+        view.updateAccentColor(colorConfig.accentColor)
+        view.listener = object : SelectionRectView.Listener {
+            override fun onMove(dx: Float, dy: Float) {
+                val p = selectionParams ?: return
+                p.x = (p.x + dx.toInt()).coerceIn(0, (screenWidth - p.width).coerceAtLeast(0))
+                p.y = (p.y + dy.toInt()).coerceIn(0, (screenHeight - p.height).coerceAtLeast(0))
+                try {
+                    windowManager.updateViewLayout(selectionRectView, p)
+                } catch (e: Exception) {
+                    Log.e(TAG, "selection move failed: ${e.message}")
+                }
+            }
+
+            override fun onResize(newWidth: Int, newHeight: Int, anchorLeft: Boolean, anchorTop: Boolean) {
+                val p = selectionParams ?: return
+                val oldW = p.width
+                val oldH = p.height
+                val w = newWidth.coerceIn(80, screenWidth.coerceAtLeast(80))
+                val h = newHeight.coerceIn(80, screenHeight.coerceAtLeast(80))
+                if (!anchorLeft) {
+                    p.x = (p.x + (oldW - w)).coerceIn(0, (screenWidth - w).coerceAtLeast(0))
+                }
+                if (!anchorTop) {
+                    p.y = (p.y + (oldH - h)).coerceIn(0, (screenHeight - h).coerceAtLeast(0))
+                }
+                p.width = w
+                p.height = h
+                try {
+                    windowManager.updateViewLayout(selectionRectView, p)
+                } catch (e: Exception) {
+                    Log.e(TAG, "selection resize failed: ${e.message}")
+                }
+            }
+
+            override fun onConfirm() {
+                captureSelectionAndOcr()
+            }
+
+            override fun onCancel() {
+                hideSelectionRect()
+                Toast.makeText(this@YomidroidAccessibilityService, "Selection cancelled", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        val params = WindowManager.LayoutParams(
+            savedW,
+            savedH,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            android.graphics.PixelFormat.TRANSLUCENT
+        )
+        params.gravity = android.view.Gravity.TOP or android.view.Gravity.START
+        params.x = savedX
+        params.y = savedY
+
+        try {
+            windowManager.addView(view, params)
+            selectionRectView = view
+            selectionParams = params
+            Log.d(TAG, "Selection rect shown at ($savedX,$savedY) ${savedW}x${savedH}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to show selection rect: ${e.message}", e)
+        }
+    }
+
+    private fun hideSelectionRect() {
+        selectionRectView?.let { v ->
+            selectionParams?.let { p ->
+                selectionPrefs.edit()
+                    .putInt("x", p.x)
+                    .putInt("y", p.y)
+                    .putInt("w", p.width)
+                    .putInt("h", p.height)
+                    .apply()
+            }
+            try {
+                windowManager.removeView(v)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to remove selection rect: ${e.message}")
+            }
+        }
+        selectionRectView = null
+        selectionParams = null
+    }
+
+    /**
+     * Screenshot the screen, crop to the current selection rectangle, and run
+     * manga-ocr directly on that crop (no detector).
+     */
+    private fun captureSelectionAndOcr() {
+        val params = selectionParams ?: return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            Toast.makeText(this, "Screenshot requires Android 11+", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        selectionRectView?.visibility = View.INVISIBLE
+        fabView?.visibility = View.INVISIBLE
+
+        handler.postDelayed({
+            takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                mainExecutor,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(result: ScreenshotResult) {
+                        updateFabVisibility()
+                        try {
+                            val hardwareBuffer = result.hardwareBuffer
+                            val colorSpace = result.colorSpace
+                            val bitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, colorSpace)
+                            if (bitmap != null) {
+                                val softwareBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                                bitmap.recycle()
+                                hardwareBuffer.close()
+                                processSelectionOcr(softwareBitmap, params)
+                            } else {
+                                hardwareBuffer.close()
+                                hideSelectionRect()
+                                Log.e(TAG, "Failed to create bitmap from hardware buffer")
+                            }
+                        } catch (e: Exception) {
+                            hideSelectionRect()
+                            Log.e(TAG, "Error processing selection screenshot: ${e.message}", e)
+                        }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        updateFabVisibility()
+                        selectionRectView?.visibility = View.VISIBLE
+                        Log.e(TAG, "Selection screenshot failed: $errorCode")
+                        Toast.makeText(
+                            this@YomidroidAccessibilityService,
+                            "Screenshot failed",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            )
+        }, FAB_HIDE_DELAY_MS)
+    }
+
+    private fun processSelectionOcr(fullBitmap: Bitmap, rectParams: WindowManager.LayoutParams) {
+        val originalWidth = fullBitmap.width
+        val originalHeight = fullBitmap.height
+        saveCropPickerSample(fullBitmap)
+
+        val scaleX = originalWidth.toFloat() / screenWidth.coerceAtLeast(1)
+        val scaleY = originalHeight.toFloat() / screenHeight.coerceAtLeast(1)
+        val left = (rectParams.x * scaleX).toInt().coerceIn(0, originalWidth - 1)
+        val top = (rectParams.y * scaleY).toInt().coerceIn(0, originalHeight - 1)
+        val right = ((rectParams.x + rectParams.width) * scaleX).toInt().coerceIn(left + 1, originalWidth)
+        val bottom = ((rectParams.y + rectParams.height) * scaleY).toInt().coerceIn(top + 1, originalHeight)
+        val cropW = right - left
+        val cropH = bottom - top
+
+        Log.d(TAG, "Selection crop bitmap=[$left,$top ${cropW}x$cropH] from ${originalWidth}x$originalHeight")
+
+        val crop = try {
+            Bitmap.createBitmap(fullBitmap, left, top, cropW, cropH)
+        } catch (e: Exception) {
+            Log.e(TAG, "Crop failed: ${e.message}", e)
+            fullBitmap.recycle()
+            hideSelectionRect()
+            return
+        }
+
+        fullBitmap.recycle()
+        hideSelectionRect()
+
+        val engine = ocrEngine
+        if (engine !is MangaOcrEngine) {
+            serviceScope.launch {
+                val result = engine?.processImage(crop) ?: Result.failure(IllegalStateException("No OCR engine"))
+                withContext(Dispatchers.Main) {
+                    result.fold(
+                        onSuccess = { ocrResults ->
+                            val merged = mergeAdjacentLines(ocrResults)
+                            if (merged.isNotEmpty()) {
+                                showTextOverlay(merged, crop, originalWidth, originalHeight, left, top)
+                            } else {
+                                Toast.makeText(this@YomidroidAccessibilityService, "No text found", Toast.LENGTH_SHORT).show()
+                                crop.recycle()
+                            }
+                        },
+                        onFailure = { e ->
+                            Toast.makeText(this@YomidroidAccessibilityService, "OCR failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                            crop.recycle()
+                        }
+                    )
+                }
+            }
+            return
+        }
+
+        serviceScope.launch {
+            val result = engine.processDirectRegion(crop)
+            withContext(Dispatchers.Main) {
+                result.fold(
+                    onSuccess = { ocrResults ->
+                        Log.d(TAG, "Direct manga-ocr success, ${ocrResults.size} results")
+                        if (ocrResults.isNotEmpty()) {
+                            showTextOverlay(ocrResults, crop, originalWidth, originalHeight, left, top)
+                        } else {
+                            Toast.makeText(this@YomidroidAccessibilityService, "No text found", Toast.LENGTH_SHORT).show()
+                            crop.recycle()
+                        }
+                    },
+                    onFailure = { e ->
+                        Log.e(TAG, "Direct manga-ocr failed: ${e.message}", e)
+                        Toast.makeText(
+                            this@YomidroidAccessibilityService,
+                            "OCR failed: ${e.message}",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        crop.recycle()
+                    }
+                )
+            }
         }
     }
 
@@ -1005,6 +1264,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
     }
 
     private fun removeOverlay() {
+        hideSelectionRect()
         // Destroy WebView popup first
         overlayPopupWebView?.destroy()
         overlayPopupWebView = null
@@ -1829,10 +2089,21 @@ class YomidroidAccessibilityService : AccessibilityService() {
                 // Single-fire actions on DOWN
                 when (action) {
                     BindableAction.SCAN -> {
-                        if (overlayView == null) captureScreen()
+                        if (overlayView == null) {
+                            if (usesSelectionRect()) {
+                                if (selectionRectView == null) showSelectionRect()
+                                else captureSelectionAndOcr()
+                            } else {
+                                captureScreen()
+                            }
+                        }
                         return true
                     }
                     BindableAction.DISMISS -> {
+                        if (selectionRectView != null) {
+                            hideSelectionRect()
+                            return true
+                        }
                         val overlay = overlayView
                         if (overlay != null) {
                             if (overlayPopupWebView?.isVisible == true) {
@@ -2392,7 +2663,15 @@ class YomidroidAccessibilityService : AccessibilityService() {
                             pendingTapRunnable?.let { handler.removeCallbacks(it) }
                             val tapRunnable = Runnable {
                                 pendingTapRunnable = null
-                                captureScreen()
+                                if (usesSelectionRect()) {
+                                    if (selectionRectView == null) {
+                                        showSelectionRect()
+                                    } else {
+                                        captureSelectionAndOcr()
+                                    }
+                                } else {
+                                    captureScreen()
+                                }
                             }
                             pendingTapRunnable = tapRunnable
                             handler.postDelayed(tapRunnable, DOUBLE_TAP_TIMEOUT_MS)

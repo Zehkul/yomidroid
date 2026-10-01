@@ -73,6 +73,57 @@ class MangaOcrEngine(
         }
     }
 
+    /**
+     * Recognize a user-selected crop directly — no text detector.
+     * The entire bitmap is treated as a single text region (Kaku-style).
+     * Optional preprocess still runs; the result's bounds cover the full crop.
+     */
+    suspend fun processDirectRegion(bitmap: Bitmap): Result<List<OcrResult>> {
+        return withContext(Dispatchers.Default) {
+            try {
+                if (!isInitialized) initialize()
+                val totalStart = SystemClock.elapsedRealtime()
+
+                val inference = mangaOcrInference
+                    ?: return@withContext Result.failure(IllegalStateException("Manga OCR not initialized"))
+                inference.bilinearScaling =
+                    config.mangaOcrCropScaling == MangaOcrCropScaling.BILINEAR
+
+                val pre = preprocessIfEnabled(bitmap)
+                try {
+                    val recStart = SystemClock.elapsedRealtime()
+                    val text = inference.recognize(pre.bitmap)
+                    val recMs = SystemClock.elapsedRealtime() - recStart
+                    Log.d(
+                        TAG,
+                        "direct-region ms=${SystemClock.elapsedRealtime() - totalStart} " +
+                            "recognize ms=$recMs chars=${text.length} " +
+                            "input=${bitmap.width}x${bitmap.height}"
+                    )
+                    if (text.isBlank()) {
+                        Result.success(emptyList())
+                    } else {
+                        val bounds = Rect(0, 0, bitmap.width, bitmap.height)
+                        Result.success(
+                            listOf(
+                                OcrResult(
+                                    text,
+                                    bounds,
+                                    OcrUtils.synthesizeCharBounds(text, bounds)
+                                )
+                            )
+                        )
+                    }
+                } finally {
+                    if (pre.bitmap !== bitmap) pre.bitmap.recycle()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Manga OCR direct region failed: ${e.message}", e)
+                Result.failure(e)
+            }
+        }
+    }
+
     private data class Pre(val bitmap: Bitmap, val scale: Float, val inverted: Boolean)
 
     private fun preprocessIfEnabled(source: Bitmap): Pre {
