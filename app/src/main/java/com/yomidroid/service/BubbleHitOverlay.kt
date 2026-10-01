@@ -30,8 +30,8 @@ class BubbleHitOverlay @JvmOverloads constructor(
     private var selected = -1
 
     // Screen-space transform (bitmap → view), same convention as OverlayTextView
-    var scaleX: Float = 1f
-    var scaleY: Float = 1f
+    var bmpScaleX: Float = 1f
+    var bmpScaleY: Float = 1f
     var cropOffsetX: Float = 0f
     var cropOffsetY: Float = 0f
 
@@ -57,10 +57,10 @@ class BubbleHitOverlay @JvmOverloads constructor(
     }
 
     private fun toScreen(r: Rect): RectF = RectF(
-        (r.left + cropOffsetX) * scaleX,
-        (r.top + cropOffsetY) * scaleY,
-        (r.right + cropOffsetX) * scaleX,
-        (r.bottom + cropOffsetY) * scaleY
+        (r.left + cropOffsetX) * bmpScaleX,
+        (r.top + cropOffsetY) * bmpScaleY,
+        (r.right + cropOffsetX) * bmpScaleX,
+        (r.bottom + cropOffsetY) * bmpScaleY
     )
 
     override fun onDraw(canvas: Canvas) {

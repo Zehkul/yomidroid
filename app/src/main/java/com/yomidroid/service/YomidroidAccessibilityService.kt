@@ -1206,8 +1206,8 @@ class YomidroidAccessibilityService : AccessibilityService() {
         val overlay = BubbleHitOverlay(this)
         val sx = screenWidth.toFloat() / originalWidth.coerceAtLeast(1)
         val sy = screenHeight.toFloat() / originalHeight.coerceAtLeast(1)
-        overlay.scaleX = sx
-        overlay.scaleY = sy
+        overlay.bmpScaleX = sx
+        overlay.bmpScaleY = sy
         overlay.cropOffsetX = cropOffsetX.toFloat()
         overlay.cropOffsetY = cropOffsetY.toFloat()
         overlay.setBubbles(
