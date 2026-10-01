@@ -41,6 +41,8 @@ class MangaOcrEngine(
         private const val TAG = "MangaOcrEngine"
         private const val PADDING = 50
         private const val LINE_MARGIN = 10
+        // DEBUG: save every crop fed to manga-ocr (+ result) to getExternalFilesDir("ocr_dump")
+        private const val DEBUG_DUMP_CROPS = true
     }
 
     override suspend fun processImage(bitmap: Bitmap): Result<List<OcrResult>> {
@@ -320,6 +322,7 @@ class MangaOcrEngine(
             vocabPath = modelManager.getVocabPath(),
             bilinearScaling = config.mangaOcrCropScaling == MangaOcrCropScaling.BILINEAR
         )
+        if (DEBUG_DUMP_CROPS) MangaOcrInference.debugDumpDir = context.getExternalFilesDir("ocr_dump")
         isInitialized = true
         Log.d(TAG, "MangaOcrEngine initialized successfully")
     }
