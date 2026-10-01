@@ -209,7 +209,9 @@ class MangaOcrEngine(
             Log.d(TAG, "recognize ms=$recMs chars=${text.length}")
             if (text.isBlank()) return@mapNotNull null
 
-            val origBounds = scaleRectDown(expanded, scale, originalBitmap)
+            // Report the detector box, not the padded crop — LINE_MARGIN is only
+            // for recognition input; including it stretched the indicator/grid.
+            val origBounds = scaleRectDown(preRect, scale, originalBitmap)
             OcrResult(text, origBounds, OcrUtils.synthesizeCharBounds(text, origBounds))
         } finally {
             if (crop !== preBitmap) crop.recycle()
