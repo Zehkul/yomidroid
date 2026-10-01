@@ -256,8 +256,8 @@ private fun MangaOcrTuningCard(
             Spacer(Modifier.height(8.dp))
             ToggleRow(
                 label = "Whole-bubble recognition",
-                description = "Cluster lines into bubbles. Faster + matches Manga109 training. " +
-                    "Loses per-line tap precision in coupled mode.",
+                description = "Cluster lines/columns into bubbles (RTL columns, height-split, " +
+                    "furigana dropped). Falls back to one box if the split looks bad.",
                 checked = config.mangaOcrWholeBubbleMode,
                 onChange = { onChange(config.copy(mangaOcrWholeBubbleMode = it)) }
             )

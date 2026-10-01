@@ -225,11 +225,25 @@ class MangaOcrEngine(
         scale: Float,
         originalBitmap: Bitmap
     ): List<OcrResult> {
-        val clusters = clusterRects(preRects)
-        Log.d(TAG, "clusters=${clusters.size} from rects=${preRects.size}")
+        // Drop furigana / ruby (small boxes beside a larger main-text box) before
+        // clustering so they do not warp column grouping or text splits.
+        val cleaned = dropFurigana(preRects)
+        val clusters = clusterRects(cleaned)
+        Log.d(
+            TAG,
+            "clusters=${clusters.size} from rects=${preRects.size} " +
+                "afterFuriganaFilter=${cleaned.size}"
+        )
 
         return clusters.flatMap { cluster ->
             val union = unionRect(cluster)
+            val vertical = cluster.count { OcrUtils.isVerticalLine(it) } * 2 >= cluster.size
+            val ordered = if (vertical) {
+                // Top → bottom within a column
+                cluster.sortedBy { it.top }
+            } else {
+                cluster.sortedBy { it.top }
+            }
             val expanded = expand(union, preBitmap)
             val crop = Bitmap.createBitmap(
                 preBitmap, expanded.left, expanded.top, expanded.width(), expanded.height()
@@ -238,13 +252,27 @@ class MangaOcrEngine(
                 val recStart = SystemClock.elapsedRealtime()
                 val text = inference.recognize(crop)
                 val recMs = SystemClock.elapsedRealtime() - recStart
-                Log.d(TAG, "recognize ms=$recMs chars=${text.length} linesInCluster=${cluster.size}")
+                Log.d(
+                    TAG,
+                    "recognize ms=$recMs chars=${text.length} " +
+                        "linesInCluster=${ordered.size} vertical=$vertical"
+                )
                 if (text.isBlank()) return@flatMap emptyList<OcrResult>()
 
-                splitTextAcrossLines(text, cluster).mapIndexed { i, slice ->
-                    val origBounds = scaleRectDown(cluster[i], scale, originalBitmap)
-                    OcrResult(slice, origBounds, OcrUtils.synthesizeCharBounds(slice, origBounds))
+                val slices = splitTextAcrossLines(text, ordered, vertical)
+                if (!isSplitReliable(text, ordered, slices)) {
+                    // Unreliable proportional split → one result for the whole bubble.
+                    val origBounds = scaleRectDown(union, scale, originalBitmap)
+                    return@flatMap listOf(
+                        OcrResult(text, origBounds, OcrUtils.synthesizeCharBounds(text, origBounds))
+                    )
                 }
+
+                slices.mapIndexed { i, slice ->
+                    if (slice.isBlank()) return@mapIndexed null
+                    val origBounds = scaleRectDown(ordered[i], scale, originalBitmap)
+                    OcrResult(slice, origBounds, OcrUtils.synthesizeCharBounds(slice, origBounds))
+                }.filterNotNull()
             } finally {
                 if (crop !== preBitmap) crop.recycle()
             }
@@ -274,39 +302,153 @@ class MangaOcrEngine(
         return out
     }
 
-    private fun clusterRects(rects: List<Rect>): List<List<Rect>> {
-        val sorted = rects.sortedBy { it.top }
-        val groups = mutableListOf<MutableList<Rect>>()
-        for (r in sorted) {
-            val match = groups.firstOrNull { g -> g.any { canCluster(it, r) } }
-            if (match != null) match.add(r) else groups.add(mutableListOf(r))
+    /**
+     * Drop small detector boxes that sit beside a clearly larger neighbour —
+     * typical furigana / ruby annotations. Keeps main body text for clustering.
+     */
+    private fun dropFurigana(rects: List<Rect>): List<Rect> {
+        if (rects.size <= 1) return rects
+        return rects.filter { small ->
+            val smallArea = small.width().toLong() * small.height()
+            val isFurigana = rects.any { large ->
+                if (large === small) return@any false
+                val largeArea = large.width().toLong() * large.height()
+                // Require a clearly larger neighbour
+                if (largeArea < smallArea * 2L) return@any false
+                if (smallArea > largeArea * 0.45) return@any false
+
+                val vOverlap = minOf(small.bottom, large.bottom) - maxOf(small.top, large.top)
+                val hOverlap = minOf(small.right, large.right) - maxOf(small.left, large.left)
+                val minH = minOf(small.height(), large.height())
+                val minW = minOf(small.width(), large.width())
+
+                // Beside horizontally (vertical-column furigana): strong vertical
+                // overlap, little or no horizontal overlap, small is to the side.
+                val besideHorizontally =
+                    vOverlap > minH * 0.35f &&
+                        hOverlap < minW * 0.25f
+
+                // Above/below (horizontal-line furigana): strong horizontal overlap
+                val besideVertically =
+                    hOverlap > minW * 0.35f &&
+                        vOverlap < minH * 0.25f
+
+                besideHorizontally || besideVertically
+            }
+            !isFurigana
         }
-        return groups.map { g -> g.sortedBy { it.top } }
     }
 
-    private fun canCluster(a: Rect, b: Rect): Boolean {
-        val overlap = (minOf(a.right, b.right) - maxOf(a.left, b.left))
-        val narrower = minOf(a.width(), b.width())
-        if (narrower <= 0 || overlap < narrower * 0.3f) return false
-        val gap = if (a.bottom <= b.top) b.top - a.bottom
-        else if (b.bottom <= a.top) a.top - b.bottom
-        else 0
+    /**
+     * Group detector boxes into bubbles / columns.
+     * Vertical-dominant pages: cluster by column (horizontal proximity), order
+     * columns right-to-left, lines top-to-bottom within a column.
+     * Horizontal-dominant: cluster by vertical stacking (previous behaviour).
+     */
+    private fun clusterRects(rects: List<Rect>): List<List<Rect>> {
+        if (rects.isEmpty()) return emptyList()
+        val verticalDominant =
+            rects.count { OcrUtils.isVerticalLine(it) } * 2 >= rects.size
+
+        val groups = mutableListOf<MutableList<Rect>>()
+        val sorted = if (verticalDominant) {
+            // Process top-to-bottom so columns grow naturally
+            rects.sortedWith(compareBy({ it.top }, { -it.right }))
+        } else {
+            rects.sortedBy { it.top }
+        }
+
+        for (r in sorted) {
+            val match = groups.firstOrNull { g ->
+                g.any {
+                    if (verticalDominant) canClusterColumn(it, r) else canClusterRow(it, r)
+                }
+            }
+            if (match != null) match.add(r) else groups.add(mutableListOf(r))
+        }
+
+        return if (verticalDominant) {
+            // Columns right → left (manga reading order)
+            groups
+                .map { g -> g.sortedBy { it.top } }
+                .sortedByDescending { g -> g.maxOf { it.right } }
+        } else {
+            groups.map { g -> g.sortedBy { it.top } }
+        }
+    }
+
+    /** Same column: centres close horizontally, stacked with a modest vertical gap. */
+    private fun canClusterColumn(a: Rect, b: Rect): Boolean {
+        val cxA = (a.left + a.right) / 2f
+        val cxB = (b.left + b.right) / 2f
+        val avgW = (a.width() + b.width()) / 2f
+        val hOverlap = minOf(a.right, b.right) - maxOf(a.left, b.left)
+        val sameColumn =
+            kotlin.math.abs(cxA - cxB) <= avgW * 0.75f ||
+                hOverlap >= minOf(a.width(), b.width()) * 0.3f
+        if (!sameColumn) return false
+        val gap = when {
+            a.bottom <= b.top -> b.top - a.bottom
+            b.bottom <= a.top -> a.top - b.bottom
+            else -> 0
+        }
         return gap <= maxOf(a.height(), b.height()) * 1.5f
     }
 
-    private fun splitTextAcrossLines(text: String, lines: List<Rect>): List<String> {
+    /** Same horizontal bubble: left-right overlap, stacked with a modest vertical gap. */
+    private fun canClusterRow(a: Rect, b: Rect): Boolean {
+        val overlap = minOf(a.right, b.right) - maxOf(a.left, b.left)
+        val narrower = minOf(a.width(), b.width())
+        if (narrower <= 0 || overlap < narrower * 0.3f) return false
+        val gap = when {
+            a.bottom <= b.top -> b.top - a.bottom
+            b.bottom <= a.top -> a.top - b.bottom
+            else -> 0
+        }
+        return gap <= maxOf(a.height(), b.height()) * 1.5f
+    }
+
+    /**
+     * Split recognised text across line boxes proportional to span on the
+     * reading axis (height for vertical columns, width for horizontal lines).
+     */
+    private fun splitTextAcrossLines(
+        text: String,
+        lines: List<Rect>,
+        vertical: Boolean
+    ): List<String> {
         if (lines.size <= 1) return listOf(text)
-        val widths = lines.map { it.width().toFloat() }
-        val total = widths.sum().coerceAtLeast(1f)
+        val spans = lines.map {
+            if (vertical) it.height().toFloat() else it.width().toFloat()
+        }
+        val total = spans.sum().coerceAtLeast(1f)
         val out = mutableListOf<String>()
         var consumed = 0
         for (i in lines.indices) {
             val end = if (i == lines.size - 1) text.length
-            else (text.length * widths.take(i + 1).sum() / total).toInt().coerceIn(consumed, text.length)
+            else (text.length * spans.take(i + 1).sum() / total).toInt()
+                .coerceIn(consumed, text.length)
             out.add(text.substring(consumed, end))
             consumed = end
         }
         return out
+    }
+
+    /**
+     * Proportional splits are approximate. Fall back to a single union result
+     * when the slice looks empty or far too short relative to the number of lines.
+     */
+    private fun isSplitReliable(
+        text: String,
+        lines: List<Rect>,
+        slices: List<String>
+    ): Boolean {
+        if (lines.size <= 1) return true
+        if (text.length < lines.size) return false
+        if (slices.size != lines.size) return false
+        // More than half the lines empty → split failed
+        if (slices.count { it.isBlank() } * 2 > lines.size) return false
+        return true
     }
 
     private fun initialize() {
