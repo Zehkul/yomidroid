@@ -156,16 +156,17 @@ class OverlayPopupWebView(private val context: Context) {
         fun makeCandidate(rawW: Int, rawH: Int, anchorX: Int, anchorY: Int, centerAxis: Char): Candidate {
             val w = rawW.coerceAtMost(maxWidth).coerceAtLeast(0)
             val h = rawH.coerceAtMost(maxHeight).coerceAtLeast(0)
+            // coerceIn throws if max < min (tiny containers / oversized popups).
+            fun clamp(v: Int, lo: Int, hi: Int): Int =
+                if (hi < lo) lo.coerceAtMost(v.coerceAtLeast(0)) else v.coerceIn(lo, hi)
             val x: Int
             val y: Int
             if (centerAxis == 'x') {
-                // Horizontal placement: center on the perpendicular (vertical) axis
-                x = anchorX.coerceIn(edgePad, containerW - w - edgePad)
-                y = (bounds.centerY() - h / 2).coerceIn(edgePad, containerH - h - edgePad)
+                x = clamp(anchorX, edgePad, containerW - w - edgePad)
+                y = clamp(bounds.centerY() - h / 2, edgePad, containerH - h - edgePad)
             } else {
-                // Vertical placement: center on the perpendicular (horizontal) axis
-                x = (bounds.centerX() - w / 2).coerceIn(edgePad, containerW - w - edgePad)
-                y = anchorY.coerceIn(edgePad, containerH - h - edgePad)
+                x = clamp(bounds.centerX() - w / 2, edgePad, containerW - w - edgePad)
+                y = clamp(anchorY, edgePad, containerH - h - edgePad)
             }
             return Candidate(w, h, x, y)
         }

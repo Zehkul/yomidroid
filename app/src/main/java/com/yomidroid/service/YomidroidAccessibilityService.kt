@@ -115,8 +115,12 @@ class YomidroidAccessibilityService : AccessibilityService() {
     private var textPanelParams: WindowManager.LayoutParams? = null
     private var textPanelContainer: android.widget.FrameLayout? = null
     private var textPanelPopup: OverlayPopupWebView? = null
+    private var textPanelPopupHost: android.widget.FrameLayout? = null
     private var selectionScanRunnable: Runnable? = null
     private var selectionScanGeneration = 0
+    // Whole-bubble hit layer (one outline per bubble; tap opens that bubble's text)
+    private var bubbleOverlayContainer: android.widget.FrameLayout? = null
+    private var bubbleHitOverlay: BubbleHitOverlay? = null
 
     // When true, FAB was hidden by TOGGLE_CURSOR and should stay hidden
     // until toggled back on or overlay is dismissed
@@ -430,6 +434,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         hideTextPanel()
+        hideBubbleHitOverlay()
         hideSelectionRect()
         super.onDestroy()
         Log.d(TAG, "Accessibility service destroyed")
@@ -632,7 +637,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
             captureSelectionAndOcr()
         }
         selectionScanRunnable = r
-        handler.postDelayed(r, 400L)
+        handler.post(r)
     }
 
     private fun hideSelectionRect() {
@@ -916,19 +921,18 @@ class YomidroidAccessibilityService : AccessibilityService() {
                         Log.d(TAG, "OCR success, found ${ocrResults.size} results")
                         val cfgNow = ocrConfigManager?.getConfig()
                         val bubbleManga = cfgNow?.selectedEngine == OcrEngineType.MANGA_OCR &&
-                            cfgNow.mangaOcrWholeBubbleMode
+                            cfgNow.mangaOcrWholeBubbleMode &&
+                            !cfgNow.mangaOcrSelectionRect
                         if (bubbleManga && ocrResults.isNotEmpty()) {
-                            // Whole-bubble manga-ocr: no reliable glyph boxes → text panel.
-                            val text = ocrResults.joinToString("\n") { it.text }.trim()
-                            if (text.isNotEmpty()) {
-                                showTextPanel(text)
-                            } else {
-                                Toast.makeText(
-                                    this@YomidroidAccessibilityService,
-                                    "No text found",
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                            }
+                            // One outline per bubble; tap opens that bubble's text only.
+                            showBubbleHitOverlay(
+                                ocrResults,
+                                bitmapForOcr,
+                                originalWidth,
+                                originalHeight,
+                                cropOffsetX,
+                                cropOffsetY
+                            )
                             return@fold
                         }
                         val merged = mergeAdjacentLines(ocrResults)
@@ -1183,24 +1187,101 @@ class YomidroidAccessibilityService : AccessibilityService() {
      * by character index. Used for selection-rectangle and whole-bubble manga-ocr
      * where synthetic glyph boxes are meaningless.
      */
-    private fun showTextPanel(text: String) {
+    private fun showBubbleHitOverlay(
+        results: List<OcrResult>,
+        screenshot: Bitmap,
+        originalWidth: Int,
+        originalHeight: Int,
+        cropOffsetX: Int,
+        cropOffsetY: Int
+    ) {
         hideTextPanel()
-        // Clear char-grid overlay only — do NOT hide the Kaku selection rectangle.
+        hideBubbleHitOverlay()
         clearCharGridOverlay()
 
+        currentScreenshot?.recycle()
+        currentScreenshot = screenshot.copy(Bitmap.Config.ARGB_8888, false)
+
+        val container = android.widget.FrameLayout(this)
+        val overlay = BubbleHitOverlay(this)
+        val sx = screenWidth.toFloat() / originalWidth.coerceAtLeast(1)
+        val sy = screenHeight.toFloat() / originalHeight.coerceAtLeast(1)
+        overlay.scaleX = sx
+        overlay.scaleY = sy
+        overlay.cropOffsetX = cropOffsetX.toFloat()
+        overlay.cropOffsetY = cropOffsetY.toFloat()
+        overlay.setBubbles(
+            results.map { BubbleHitOverlay.Bubble(Rect(it.lineBounds), it.text) }
+        )
+        overlay.listener = object : BubbleHitOverlay.Listener {
+            override fun onBubbleTapped(index: Int, bubble: BubbleHitOverlay.Bubble) {
+                // Panel only for the tapped bubble
+                showTextPanel(bubble.text)
+            }
+            override fun onBackgroundTapped() {
+                hideTextPanel()
+            }
+        }
+        container.addView(
+            overlay,
+            android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        val params = WindowManager.LayoutParams(
+            screenWidth,
+            screenHeight,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            android.graphics.PixelFormat.TRANSLUCENT
+        )
+        params.gravity = android.view.Gravity.TOP or android.view.Gravity.START
+        params.x = 0
+        params.y = 0
+        try {
+            windowManager.addView(container, params)
+            bubbleOverlayContainer = container
+            bubbleHitOverlay = overlay
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to show bubble overlay: ${e.message}", e)
+        }
+    }
+
+    private fun hideBubbleHitOverlay() {
+        bubbleOverlayContainer?.let { c ->
+            try {
+                windowManager.removeView(c)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to remove bubble overlay: ${e.message}")
+            }
+        }
+        bubbleOverlayContainer = null
+        bubbleHitOverlay = null
+    }
+
+    /**
+     * Minimal text strip for word lookup. Used by Kaku selection and by
+     * tapping a single bubble in whole-bubble mode.
+     */
+    private fun showTextPanel(text: String) {
+        hideTextPanel()
+
         val density = resources.displayMetrics.density
-        val panelHeight = (minOf(screenHeight * 0.28f, 220 * density)).toInt().coerceAtLeast(120)
-        val panelWidth = (screenWidth * 0.92f).toInt()
-        val panelX = ((screenWidth - panelWidth) / 2).coerceAtLeast(0)
-        // Sit just above the bottom edge so it does not cover the selection rect mid-screen
-        val panelY = (screenHeight - panelHeight - (48 * density).toInt()).coerceAtLeast(0)
+        val panelHeight = (minOf(screenHeight * 0.22f, 160 * density)).toInt().coerceAtLeast(96)
+        val panelWidth = screenWidth
+        val panelX = 0
+        val panelY = (screenHeight - panelHeight).coerceAtLeast(0)
 
         val container = android.widget.FrameLayout(this)
         val panel = OcrTextSelectPanel(this)
         panel.setOcrText(text)
         panel.listener = object : OcrTextSelectPanel.Listener {
             override fun onCharTapped(t: String, charIndex: Int) {
-                lookupFromTextPanel(t, charIndex, container)
+                lookupFromTextPanel(t, charIndex)
             }
             override fun onDismiss() {
                 hideTextPanel()
@@ -1232,16 +1313,49 @@ class YomidroidAccessibilityService : AccessibilityService() {
             textPanelContainer = container
             textPanelView = panel
             textPanelParams = params
-            textPanelPopup = OverlayPopupWebView(this)
+            // Full-screen host for the dictionary popup so layout math is not
+            // constrained to the thin text strip (that was the crash).
+            ensureTextPanelPopupHost()
             Log.d(TAG, "Text panel shown: ${text.take(40)}…")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to show text panel: ${e.message}", e)
         }
     }
 
+    private fun ensureTextPanelPopupHost() {
+        if (textPanelPopupHost != null) return
+        val host = android.widget.FrameLayout(this)
+        val params = WindowManager.LayoutParams(
+            screenWidth,
+            screenHeight,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            android.graphics.PixelFormat.TRANSLUCENT
+        )
+        params.gravity = android.view.Gravity.TOP or android.view.Gravity.START
+        try {
+            windowManager.addView(host, params)
+            textPanelPopupHost = host
+            textPanelPopup = OverlayPopupWebView(this)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to add popup host: ${e.message}", e)
+        }
+    }
+
     private fun hideTextPanel() {
         textPanelPopup?.destroy()
         textPanelPopup = null
+        textPanelPopupHost?.let { h ->
+            try {
+                windowManager.removeView(h)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to remove popup host: ${e.message}")
+            }
+        }
+        textPanelPopupHost = null
         textPanelContainer?.let { c ->
             try {
                 windowManager.removeView(c)
@@ -1254,11 +1368,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
         textPanelParams = null
     }
 
-    private fun lookupFromTextPanel(
-        text: String,
-        charIndex: Int,
-        container: android.widget.FrameLayout
-    ) {
+    private fun lookupFromTextPanel(text: String, charIndex: Int) {
         if (charIndex < 0 || charIndex >= text.length) return
         val searchText = text.substring(charIndex)
         serviceScope.launch {
@@ -1274,19 +1384,34 @@ class YomidroidAccessibilityService : AccessibilityService() {
                     ).show()
                     return@withContext
                 }
+                ensureTextPanelPopupHost()
+                // Host must be touchable while the popup is up
+                textPanelPopupHost?.let { host ->
+                    val lp = host.layoutParams as? WindowManager.LayoutParams
+                    if (lp != null) {
+                        lp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        try {
+                            windowManager.updateViewLayout(host, lp)
+                        } catch (_: Exception) {}
+                    }
+                }
+                val host = textPanelPopupHost ?: return@withContext
                 val density = resources.displayMetrics.density
+                val panelY = textPanelParams?.y ?: (screenHeight - 120)
                 val anchor = Rect(
-                    (screenWidth * 0.1f).toInt(),
-                    (textPanelParams?.y ?: 0) - (8 * density).toInt(),
-                    (screenWidth * 0.9f).toInt(),
-                    (textPanelParams?.y ?: 0)
+                    (screenWidth * 0.05f).toInt(),
+                    (panelY - 8 * density).toInt().coerceAtLeast(0),
+                    (screenWidth * 0.95f).toInt(),
+                    panelY
                 )
                 val popup = textPanelPopup ?: OverlayPopupWebView(this@YomidroidAccessibilityService).also {
                     textPanelPopup = it
                 }
                 popup.dictionaryCssMap = dictConfigManager?.getAllDictionaryCss() ?: emptyMap()
                 popup.show(
-                    container = container,
+                    container = host,
                     entries = entries,
                     textBounds = anchor,
                     maxWidth = (screenWidth * 0.9f).toInt(),
@@ -1302,7 +1427,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
                             withContext(Dispatchers.Main) {
                                 if (more.isNotEmpty()) {
                                     popup.show(
-                                        container = container,
+                                        container = host,
                                         entries = more,
                                         textBounds = anchor,
                                         maxWidth = (screenWidth * 0.9f).toInt(),
@@ -1483,6 +1608,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
 
     private fun removeOverlay() {
         hideTextPanel()
+        hideBubbleHitOverlay()
         hideSelectionRect()
         // Destroy WebView popup first
         overlayPopupWebView?.destroy()

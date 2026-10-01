@@ -3,10 +3,8 @@ package com.yomidroid.service
 import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.util.AttributeSet
 import android.util.TypedValue
-import android.view.Gravity
 import android.view.MotionEvent
 import android.widget.FrameLayout
 import android.widget.ScrollView
@@ -14,9 +12,8 @@ import android.widget.TextView
 import kotlin.math.max
 
 /**
- * Kaku-style OCR result panel: shows recognised text as normal Japanese text.
- * Taps map to a character index so the host can run longest-match dictionary
- * lookup — no synthetic per-glyph boxes (manga-ocr does not provide them).
+ * Minimal OCR text panel: recognised text as plain Japanese, tap → char index
+ * for longest-match dictionary lookup. No chrome (no rounded card / fat padding).
  */
 class OcrTextSelectPanel @JvmOverloads constructor(
     context: Context,
@@ -24,7 +21,6 @@ class OcrTextSelectPanel @JvmOverloads constructor(
 ) : FrameLayout(context, attrs) {
 
     interface Listener {
-        /** [charIndex] is the code-unit index in [text] under the tap. */
         fun onCharTapped(text: String, charIndex: Int)
         fun onDismiss()
     }
@@ -36,29 +32,21 @@ class OcrTextSelectPanel @JvmOverloads constructor(
     private var currentText: String = ""
 
     init {
-        val bg = GradientDrawable().apply {
-            setColor(0xF01E1E1E.toInt())
-            cornerRadius = 12f * density
-            setStroke((1.5f * density).toInt(), 0xFF42A5F5.toInt())
-        }
-        background = bg
+        // Flat semi-opaque strip — no rounded corners, minimal inset
+        setBackgroundColor(0xE0121212.toInt())
         setPadding(
-            (12 * density).toInt(),
-            (10 * density).toInt(),
-            (12 * density).toInt(),
-            (10 * density).toInt()
+            (8 * density).toInt(),
+            (6 * density).toInt(),
+            (8 * density).toInt(),
+            (6 * density).toInt()
         )
-        elevation = 8f * density
 
         textView = TextView(context).apply {
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
             typeface = Typeface.SERIF
-            setLineSpacing(0f, 1.25f)
-            // Soft wrap; vertical text is still shown left-to-right in lines,
-            // which is fine for lookup — the point is selectable runs of text.
+            setLineSpacing(0f, 1.15f)
             setTextIsSelectable(false)
-            // Transparent highlight when we draw our own later
             highlightColor = 0x5542A5F5
         }
 
@@ -80,16 +68,12 @@ class OcrTextSelectPanel @JvmOverloads constructor(
                 val line = layout.getLineForVertical(y.coerceIn(0, max(0, layout.height - 1)))
                 val offset = layout.getOffsetForHorizontal(line, x.toFloat())
                     .coerceIn(0, currentText.length)
-                // Prefer the character under the tap; if at end, step back one.
                 val idx = if (offset >= currentText.length && currentText.isNotEmpty()) {
                     currentText.length - 1
-                } else {
-                    offset
-                }
+                } else offset
                 listener?.onCharTapped(currentText, idx)
                 true
             } else {
-                // Consume DOWN so the parent doesn't steal the gesture.
                 event.action == MotionEvent.ACTION_DOWN
             }
         }
@@ -97,8 +81,6 @@ class OcrTextSelectPanel @JvmOverloads constructor(
 
     fun setOcrText(text: String) {
         currentText = text
-        // Insert newlines between runs of CJK if the source already has them;
-        // otherwise show as a single block.
         textView.text = text
     }
 

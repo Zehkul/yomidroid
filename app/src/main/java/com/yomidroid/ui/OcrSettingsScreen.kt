@@ -247,19 +247,33 @@ private fun MangaOcrTuningCard(
             Spacer(Modifier.height(16.dp))
             ToggleRow(
                 label = "Selection rectangle (Kaku-style)",
-                description = "Persistent movable box; auto-scans after move/resize. Results " +
-                    "open as tappable text for word lookup (no fake glyph grid). Off = vanilla.",
+                description = "Persistent movable box; scans on move/resize. Tappable text " +
+                    "panel for word lookup. Mutually exclusive with whole-bubble.",
                 checked = config.mangaOcrSelectionRect,
-                onChange = { onChange(config.copy(mangaOcrSelectionRect = it)) }
+                onChange = { enabled ->
+                    onChange(
+                        config.copy(
+                            mangaOcrSelectionRect = enabled,
+                            mangaOcrWholeBubbleMode = if (enabled) false else config.mangaOcrWholeBubbleMode
+                        )
+                    )
+                }
             )
 
             Spacer(Modifier.height(8.dp))
             ToggleRow(
                 label = "Whole-bubble recognition",
-                description = "Cluster lines/columns into bubbles (RTL columns, height-split, " +
-                    "furigana dropped). Falls back to one box if the split looks bad.",
+                description = "Cluster into bubbles; tap a bubble outline to open its text. " +
+                    "Mutually exclusive with selection rectangle.",
                 checked = config.mangaOcrWholeBubbleMode,
-                onChange = { onChange(config.copy(mangaOcrWholeBubbleMode = it)) }
+                onChange = { enabled ->
+                    onChange(
+                        config.copy(
+                            mangaOcrWholeBubbleMode = enabled,
+                            mangaOcrSelectionRect = if (enabled) false else config.mangaOcrSelectionRect
+                        )
+                    )
+                }
             )
 
             Spacer(Modifier.height(8.dp))
