@@ -157,32 +157,67 @@ class MangaOcrEngine(
 
     private suspend fun detect(preBitmap: Bitmap): List<Rect> {
         val detStart = SystemClock.elapsedRealtime()
-        val rects = when (config.mangaOcrDetector) {
-            MangaOcrDetector.PADDLE_OCR -> detectWithPaddleOcr(preBitmap)
-            MangaOcrDetector.ML_KIT_HYBRID -> detectWithMlKit(preBitmap)
+        val rects = try {
+            when (config.mangaOcrDetector) {
+                MangaOcrDetector.PADDLE_OCR -> {
+                    try {
+                        detectWithPaddleOcr(preBitmap)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "PaddleOCR detect failed, falling back to ML Kit: ${e.message}", e)
+                        detectWithMlKit(preBitmap)
+                    }
+                }
+                MangaOcrDetector.ML_KIT_HYBRID -> detectWithMlKit(preBitmap)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "detect failed: ${e.message}", e)
+            emptyList()
         }
         val detMs = SystemClock.elapsedRealtime() - detStart
         Log.d(TAG, "detect ms=$detMs regions=${rects.size} backend=${config.mangaOcrDetector}")
         return rects
     }
 
+    /**
+     * Run RapidOCR for **boxes only**. Classification/recognition are disabled —
+     * manga-ocr does recognition. OpenCV needs a software ARGB_8888 bitmap.
+     */
     private fun detectWithPaddleOcr(preBitmap: Bitmap): List<Rect> {
         val rapid = rapidEngine ?: return emptyList()
-        val det = rapid.detect(
-            bmp = preBitmap,
-            scaleUp = false,
-            maxSideLen = config.mangaOcrMaxSideLen,
-            padding = PADDING,
-            boxScoreThresh = 0.5f,
-            boxThresh = 0.3f,
-            unClipRatio = 1.6f,
-            doCls = true,
-            mostCls = true
-        )
-        return det.detResults.mapNotNull { d ->
-            val r = pointsToRect(d.points)
-            if (r.width() <= 0 || r.height() <= 0) null else r
+        val bmp = ensureSoftwareArgb8888(preBitmap)
+        try {
+            // OcrEngine is not thread-safe (shared OrtSession / OpenCV Mats).
+            val det = synchronized(rapid) {
+                rapid.detect(
+                    bmp = bmp,
+                    scaleUp = false,
+                    maxSideLen = config.mangaOcrMaxSideLen,
+                    padding = PADDING,
+                    boxScoreThresh = 0.5f,
+                    boxThresh = 0.3f,
+                    unClipRatio = 1.6f,
+                    doCls = false,
+                    mostCls = false
+                )
+            }
+            return det.detResults.mapNotNull { d ->
+                val r = pointsToRect(d.points)
+                if (r.width() <= 0 || r.height() <= 0) null else r
+            }
+        } finally {
+            if (bmp !== preBitmap) bmp.recycle()
         }
+    }
+
+    private fun ensureSoftwareArgb8888(src: Bitmap): Bitmap {
+        if (src.isRecycled) {
+            throw IllegalArgumentException("Bitmap is recycled")
+        }
+        if (src.config == Bitmap.Config.ARGB_8888 && src.isMutable) {
+            return src
+        }
+        return src.copy(Bitmap.Config.ARGB_8888, /* mutable */ true)
+            ?: throw IllegalStateException("Failed to copy bitmap to ARGB_8888")
     }
 
     private suspend fun detectWithMlKit(preBitmap: Bitmap): List<Rect> {
