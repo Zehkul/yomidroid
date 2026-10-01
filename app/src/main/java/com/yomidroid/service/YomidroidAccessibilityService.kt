@@ -116,6 +116,8 @@ class YomidroidAccessibilityService : AccessibilityService() {
     private var textPanelContainer: android.widget.FrameLayout? = null
     private var textPanelPopup: OverlayPopupWebView? = null
     private var textPanelPopupHost: android.widget.FrameLayout? = null
+    /** Full-screen layer under the text strip; tap dismisses the strip (Kaku + bubble). */
+    private var textPanelDismissShield: android.view.View? = null
     private var selectionScanRunnable: Runnable? = null
     private var selectionScanGeneration = 0
     // Whole-bubble hit layer (one outline per bubble; tap opens that bubble's text)
@@ -292,6 +294,8 @@ class YomidroidAccessibilityService : AccessibilityService() {
      * Reload OCR settings (call when settings change).
      */
     fun reloadOcrSettings() {
+        // Selection-rect vs FAB mode may have changed.
+        handler.post { updateFabVisibility() }
         initializeOcrEngine()
     }
 
@@ -329,8 +333,28 @@ class YomidroidAccessibilityService : AccessibilityService() {
     fun updateFabVisibility() {
         val config = colorConfigManager?.getConfig() ?: return
         val visible = config.fabEnabled && !fabHiddenByToggle
-        fabView?.visibility = if (visible) View.VISIBLE else View.GONE
-        Log.d(TAG, "FAB visibility updated: enabled=${config.fabEnabled}, hiddenByToggle=$fabHiddenByToggle")
+        if (usesSelectionRect()) {
+            // Kaku mode: selection rectangle wholesale replaces the floating button.
+            fabView?.visibility = View.GONE
+            if (visible) {
+                if (selectionRectView == null) showSelectionRect()
+                else selectionRectView?.visibility = View.VISIBLE
+            } else {
+                hideSelectionRect()
+                hideTextPanel()
+            }
+        } else {
+            if (selectionRectView != null) {
+                hideSelectionRect()
+                hideTextPanel()
+            }
+            fabView?.visibility = if (visible) View.VISIBLE else View.GONE
+        }
+        Log.d(
+            TAG,
+            "FAB visibility updated: enabled=${config.fabEnabled}, " +
+                "hiddenByToggle=$fabHiddenByToggle, kaku=${usesSelectionRect()}"
+        )
     }
 
     private fun getStatusBarHeight(): Int {
@@ -1224,7 +1248,9 @@ class YomidroidAccessibilityService : AccessibilityService() {
                 showTextPanel(bubble.text)
             }
             override fun onBackgroundTapped() {
+                // Full dismiss — bubble layer was locking the screen.
                 hideTextPanel()
+                hideBubbleHitOverlay()
             }
         }
         container.addView(
@@ -1240,6 +1266,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
             screenHeight,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             android.graphics.PixelFormat.TRANSLUCENT
@@ -1276,10 +1303,38 @@ class YomidroidAccessibilityService : AccessibilityService() {
         hideTextPanel()
 
         val density = resources.displayMetrics.density
-        val panelHeight = (minOf(screenHeight * 0.22f, 160 * density)).toInt().coerceAtLeast(96)
+        val panelHeight = (minOf(screenHeight * 0.24f, 180 * density)).toInt().coerceAtLeast(100)
         val panelWidth = screenWidth
-        val panelX = 0
         val panelY = (screenHeight - panelHeight).coerceAtLeast(0)
+
+        // Full-screen dismiss shield under the strip: tap anywhere outside the
+        // strip closes the panel (selection rect stays up in Kaku mode).
+        val shield = android.view.View(this).apply {
+            setBackgroundColor(0x00000000)
+            setOnTouchListener { _, event ->
+                if (event.action == android.view.MotionEvent.ACTION_UP) {
+                    hideTextPanel()
+                }
+                true
+            }
+        }
+        val shieldParams = WindowManager.LayoutParams(
+            screenWidth,
+            screenHeight,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            android.graphics.PixelFormat.TRANSLUCENT
+        )
+        shieldParams.gravity = android.view.Gravity.TOP or android.view.Gravity.START
+        try {
+            windowManager.addView(shield, shieldParams)
+            textPanelDismissShield = shield
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to add dismiss shield: ${e.message}", e)
+        }
 
         val container = android.widget.FrameLayout(this)
         val panel = OcrTextSelectPanel(this)
@@ -1305,12 +1360,13 @@ class YomidroidAccessibilityService : AccessibilityService() {
             panelHeight,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             android.graphics.PixelFormat.TRANSLUCENT
         )
         params.gravity = android.view.Gravity.TOP or android.view.Gravity.START
-        params.x = panelX
+        params.x = 0
         params.y = panelY
 
         try {
@@ -1318,8 +1374,19 @@ class YomidroidAccessibilityService : AccessibilityService() {
             textPanelContainer = container
             textPanelView = panel
             textPanelParams = params
-            // Full-screen host for the dictionary popup so layout math is not
-            // constrained to the thin text strip (that was the crash).
+            // Keep the Kaku selection rectangle above the dismiss shield so it
+            // remains movable while the text strip is open.
+            selectionRectView?.let { rect ->
+                val sp = selectionParams
+                if (sp != null) {
+                    try {
+                        windowManager.removeView(rect)
+                        windowManager.addView(rect, sp)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "re-order selection rect: ${e.message}")
+                    }
+                }
+            }
             ensureTextPanelPopupHost()
             Log.d(TAG, "Text panel shown: ${text.take(40)}…")
         } catch (e: Exception) {
@@ -1406,6 +1473,14 @@ class YomidroidAccessibilityService : AccessibilityService() {
         textPanelContainer = null
         textPanelView = null
         textPanelParams = null
+        textPanelDismissShield?.let { s ->
+            try {
+                windowManager.removeView(s)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to remove dismiss shield: ${e.message}")
+            }
+        }
+        textPanelDismissShield = null
     }
 
     private fun lookupFromTextPanel(text: String, charIndex: Int) {
@@ -1439,6 +1514,10 @@ class YomidroidAccessibilityService : AccessibilityService() {
                 val popup = textPanelPopup ?: OverlayPopupWebView(this@YomidroidAccessibilityService).also {
                     textPanelPopup = it
                 }
+                val matched = entries.firstOrNull()?.matchedText.orEmpty()
+                if (matched.isNotEmpty()) {
+                    textPanelView?.setHighlight(charIndex, charIndex + matched.length)
+                }
                 popup.dictionaryCssMap = dictConfigManager?.getAllDictionaryCss() ?: emptyMap()
                 popup.show(
                     container = host,
@@ -1448,7 +1527,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
                     maxHeight = (screenHeight * 0.45f).toInt(),
                     customCss = null,
                     onAnkiExport = { entry, idx -> exportToAnki(entry, text, idx) },
-                    originalMatchedText = entries.firstOrNull()?.matchedText,
+                    originalMatchedText = matched.ifEmpty { null },
                     onLookupTerm = { q ->
                         serviceScope.launch {
                             val more = withContext(Dispatchers.IO) {
