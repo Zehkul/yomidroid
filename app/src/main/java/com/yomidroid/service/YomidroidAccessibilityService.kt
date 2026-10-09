@@ -1634,11 +1634,18 @@ class YomidroidAccessibilityService : AccessibilityService() {
                 val host = textPanelPopupHost ?: return@withContext
                 val density = resources.displayMetrics.density
                 val panelY = textPanelParams?.y ?: (screenHeight - 120)
+                // Popup must stay entirely above the black text strip so it
+                // cannot cover it after content-height resize.
+                val ceiling = (panelY - 4 * density).toInt().coerceAtLeast(80)
+                val maxH = minOf((screenHeight * 0.45f).toInt(), ceiling - 16)
+                // Anchor in the free band above the strip (not on the strip edge)
+                // so the first layout is already mid-screen, not a flash-then-drop.
+                val bandMid = (ceiling / 2).coerceAtLeast(0)
                 val anchor = Rect(
-                    (screenWidth * 0.05f).toInt(),
-                    (panelY - 8 * density).toInt().coerceAtLeast(0),
-                    (screenWidth * 0.95f).toInt(),
-                    panelY
+                    (screenWidth * 0.1f).toInt(),
+                    (bandMid - 20 * density).toInt().coerceAtLeast(0),
+                    (screenWidth * 0.9f).toInt(),
+                    (bandMid + 20 * density).toInt().coerceAtMost(ceiling)
                 )
                 val popup = textPanelPopup ?: OverlayPopupWebView(this@YomidroidAccessibilityService).also {
                     textPanelPopup = it
@@ -1653,7 +1660,7 @@ class YomidroidAccessibilityService : AccessibilityService() {
                     entries = entries,
                     textBounds = anchor,
                     maxWidth = (screenWidth * 0.9f).toInt(),
-                    maxHeight = (screenHeight * 0.45f).toInt(),
+                    maxHeight = maxH,
                     customCss = null,
                     onAnkiExport = { entry, idx -> exportToAnki(entry, text, idx) },
                     originalMatchedText = matched.ifEmpty { null },
@@ -1670,15 +1677,17 @@ class YomidroidAccessibilityService : AccessibilityService() {
                                         entries = more,
                                         textBounds = anchor,
                                         maxWidth = (screenWidth * 0.9f).toInt(),
-                                        maxHeight = (screenHeight * 0.45f).toInt(),
+                                        maxHeight = maxH,
                                         customCss = null,
                                         onAnkiExport = { entry, idx -> exportToAnki(entry, text, idx) },
-                                        originalMatchedText = more.firstOrNull()?.matchedText
+                                        originalMatchedText = more.firstOrNull()?.matchedText,
+                                        layoutCeiling = ceiling
                                     )
                                 }
                             }
                         }
-                    }
+                    },
+                    layoutCeiling = ceiling
                 )
             }
         }
