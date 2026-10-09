@@ -1481,6 +1481,14 @@ class YomidroidAccessibilityService : AccessibilityService() {
             }
             ensureTextPanelPopupHost()
             Log.d(TAG, "Text panel shown: ${text.take(40)}…")
+            // Auto-select the first word(s) as if the user tapped the start.
+            handler.post {
+                val p = textPanelView ?: return@post
+                val t = p.getOcrText()
+                if (t.isNotEmpty()) {
+                    lookupFromTextPanel(t, p.firstContentIndex())
+                }
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to show text panel: ${e.message}", e)
         }
@@ -1489,14 +1497,17 @@ class YomidroidAccessibilityService : AccessibilityService() {
     private fun ensureTextPanelPopupHost() {
         if (textPanelPopupHost != null) return
         val host = android.widget.FrameLayout(this).apply {
-            // Touches outside the dictionary WebView dismiss the popup and
-            // restore pass-through so the rest of the screen is usable again.
+            // Full-screen host sits above the text strip while a dictionary
+            // popup is open. One tap does the useful action — never a dead
+            // "eat this tap to close" step:
+            //  - inside the black text strip → select that word / open next lookup
+            //  - outside the strip → close popup + strip together
+            // Touches on the WebView itself are handled by the child WebView.
             setOnTouchListener { _, event ->
-                if (event.action == android.view.MotionEvent.ACTION_DOWN) {
-                    dismissTextPanelPopup()
+                if (event.action != android.view.MotionEvent.ACTION_UP) {
+                    return@setOnTouchListener true
                 }
-                // Consume the outside tap so it doesn't fall into a half-broken state,
-                // then pass-through is restored for subsequent touches.
+                handlePopupHostOutsideTap(event.rawX, event.rawY)
                 true
             }
         }
@@ -1519,6 +1530,32 @@ class YomidroidAccessibilityService : AccessibilityService() {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to add popup host: ${e.message}", e)
         }
+    }
+
+    /**
+     * Single-tap routing while the dictionary popup host is touchable.
+     * [rawX]/[rawY] are screen coordinates.
+     */
+    private fun handlePopupHostOutsideTap(rawX: Float, rawY: Float) {
+        val pp = textPanelParams
+        val panel = textPanelView
+        if (pp != null && panel != null) {
+            val inPanel = rawX >= pp.x && rawX < pp.x + pp.width &&
+                rawY >= pp.y && rawY < pp.y + pp.height
+            if (inPanel) {
+                val localX = rawX - pp.x
+                val localY = rawY - pp.y
+                val idx = panel.charIndexAtPanel(localX, localY)
+                val t = panel.getOcrText()
+                if (idx >= 0 && t.isNotEmpty()) {
+                    // Replace current lookup immediately — no intermediate dismiss tap.
+                    lookupFromTextPanel(t, idx)
+                    return
+                }
+            }
+        }
+        // Outside the black box (or no panel): close popup and strip together.
+        hideTextPanel()
     }
 
     /** Full-screen host must not eat touches when no dictionary popup is visible. */

@@ -33,12 +33,12 @@ class OcrTextSelectPanel @JvmOverloads constructor(
 
     private val density = resources.displayMetrics.density
     private val textView: TextView
+    private val scrollView: ScrollView
     private var currentText: String = ""
     private var highlightStart: Int = -1
     private var highlightEnd: Int = -1
 
     init {
-        // More transparent so underlying manga stays readable
         setBackgroundColor(0x99101010.toInt())
         setPadding(
             (8 * density).toInt(),
@@ -56,28 +56,19 @@ class OcrTextSelectPanel @JvmOverloads constructor(
             highlightColor = 0x6642A5F5
         }
 
-        val scroll = ScrollView(context).apply {
+        scrollView = ScrollView(context).apply {
             isFillViewport = true
             addView(
                 textView,
                 LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
             )
         }
-        addView(scroll, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        addView(scrollView, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
 
-        textView.setOnTouchListener { v, event ->
+        textView.setOnTouchListener { _, event ->
             if (event.action == MotionEvent.ACTION_UP && currentText.isNotEmpty()) {
-                val tv = v as TextView
-                val layout = tv.layout ?: return@setOnTouchListener false
-                val x = event.x.toInt() - tv.totalPaddingLeft + tv.scrollX
-                val y = event.y.toInt() - tv.totalPaddingTop + tv.scrollY
-                val line = layout.getLineForVertical(y.coerceIn(0, max(0, layout.height - 1)))
-                val offset = layout.getOffsetForHorizontal(line, x.toFloat())
-                    .coerceIn(0, currentText.length)
-                val idx = if (offset >= currentText.length && currentText.isNotEmpty()) {
-                    currentText.length - 1
-                } else offset
-                listener?.onCharTapped(currentText, idx)
+                val idx = charIndexAtLocal(event.x, event.y)
+                if (idx >= 0) listener?.onCharTapped(currentText, idx)
                 true
             } else {
                 event.action == MotionEvent.ACTION_DOWN
@@ -92,7 +83,38 @@ class OcrTextSelectPanel @JvmOverloads constructor(
         textView.text = text
     }
 
-    /** Highlight [start, end) in the panel (e.g. matched dictionary term). */
+    /**
+     * Map coordinates in this panel's window space (origin = top-left of the
+     * panel view including padding) to a character index, or -1 if none.
+     */
+    fun charIndexAtPanel(x: Float, y: Float): Int {
+        if (currentText.isEmpty()) return -1
+        // Panel coords → textView local (account for padding + scroll)
+        val tvX = x - paddingLeft - scrollView.paddingLeft + scrollView.scrollX
+        val tvY = y - paddingTop - scrollView.paddingTop + scrollView.scrollY
+        return charIndexAtLocal(tvX, tvY)
+    }
+
+    private fun charIndexAtLocal(x: Float, y: Float): Int {
+        if (currentText.isEmpty()) return -1
+        val layout = textView.layout ?: return -1
+        val lx = (x - textView.totalPaddingLeft + textView.scrollX).toInt()
+        val ly = (y - textView.totalPaddingTop + textView.scrollY).toInt()
+        val line = layout.getLineForVertical(ly.coerceIn(0, max(0, layout.height - 1)))
+        val offset = layout.getOffsetForHorizontal(line, lx.toFloat())
+            .coerceIn(0, currentText.length)
+        return if (offset >= currentText.length && currentText.isNotEmpty()) {
+            currentText.length - 1
+        } else offset
+    }
+
+    /** First non-whitespace character index, or 0. */
+    fun firstContentIndex(): Int {
+        if (currentText.isEmpty()) return 0
+        val i = currentText.indexOfFirst { !it.isWhitespace() }
+        return if (i < 0) 0 else i
+    }
+
     fun setHighlight(start: Int, end: Int) {
         if (currentText.isEmpty()) return
         val s = start.coerceIn(0, currentText.length)
