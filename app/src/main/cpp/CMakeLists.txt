@@ -9,6 +9,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED true)
 
 # llama.cpp source directory
 set(LLAMA_SRC ${CMAKE_CURRENT_LIST_DIR}/llama.cpp)
+set(HOSHI_SRC ${CMAKE_CURRENT_LIST_DIR}/hoshidicts)
+
+# Fail early with an actionable message when git submodules were not initialized.
+# A plain `git clone` leaves these directories empty and CMake otherwise only
+# reports the opaque "does not contain a CMakeLists.txt file" error.
+if(NOT EXISTS "${LLAMA_SRC}/CMakeLists.txt" OR NOT EXISTS "${HOSHI_SRC}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "Native git submodules are missing or empty.\n"
+        "  Expected: ${LLAMA_SRC}/CMakeLists.txt\n"
+        "  Expected: ${HOSHI_SRC}/CMakeLists.txt\n"
+        "Fix from the repo root:\n"
+        "  ./scripts/init-submodules.sh\n"
+        "Or:\n"
+        "  git submodule update --init --recursive\n"
+        "If nested utf8proc fails (SSH URL), see README Build from Source.")
+endif()
 
 # Disable features we don't need
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
@@ -52,7 +68,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 # built. Force the hoshidicts lib + its deps static so we ship one extra .so
 # (yomidroid_dict) rather than a chain of shared libs; llama above already
 # enabled BUILD_SHARED_LIBS globally, so we shadow it for this subtree only.
-set(HOSHI_SRC ${CMAKE_CURRENT_LIST_DIR}/hoshidicts)
+# HOSHI_SRC already set above (submodule presence checked)
 set(BUILD_SHARED_LIBS OFF)
 add_subdirectory(${HOSHI_SRC} build-hoshidicts)
 
