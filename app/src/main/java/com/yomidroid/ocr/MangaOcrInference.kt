@@ -31,6 +31,10 @@ class MangaOcrInference(
         // out-of-distribution input (was 300 — up to 300 sequential decoder
         // steps with no KV cache).
         private const val MAX_TOKENS = 64
+
+        /** DEBUG: when non-null, every crop handed to recognize() is saved here with its result. */
+        @Volatile var debugDumpDir: java.io.File? = null
+        private var dumpCounter = 0
     }
 
     private val env = OrtEnvironment.getEnvironment()
@@ -80,10 +84,24 @@ class MangaOcrInference(
             val decMs = SystemClock.elapsedRealtime() - decStart
             Log.d(TAG, "encoder ms=$encMs decoder ms=$decMs steps=$steps")
 
-            return tokenizer.decode(tokenIds)
+            val text = tokenizer.decode(tokenIds)
+            debugDumpDir?.let { dumpDebug(it, bitmap, tokenIds, text) }
+            return text
         } finally {
             inputTensor.close()
             encoderOutput?.close()
+        }
+    }
+
+    private fun dumpDebug(dir: java.io.File, crop: Bitmap, ids: List<Int>, text: String) {
+        try {
+            dir.mkdirs()
+            val n = dumpCounter++
+            val name = "crop_%04d.png".format(n)
+            java.io.File(dir, name).outputStream().use { crop.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            java.io.File(dir, "results.tsv").appendText("$name\t${crop.width}x${crop.height}\t$text\t$ids\n")
+        } catch (e: Exception) {
+            Log.w(TAG, "debug dump failed: ${e.message}")
         }
     }
 

@@ -82,7 +82,12 @@ class OcrEngine(context: Context) : Closeable {
         Logger.i("Parameter: scaleUp($scaleUp), maxSideLen($maxSideLen), padding($padding),boxScoreThresh($boxScoreThresh),boxThresh($boxThresh),unClipRatio($unClipRatio),doCls($doCls),mostCls($mostCls)")
 
         Logger.i("---------- step: input Bitmap -> Mat(RGBA) -> Mat(BGR) ----------")
-        val inputRGBA = Mat(bmp.width, bmp.height, CvType.CV_8UC4)
+        // Empty Mat: bitmapToMat allocates the correct (rows=height, cols=width) size.
+        // Constructing Mat(width, height) swaps rows/cols and breaks portrait screenshots.
+        if (bmp.isRecycled) {
+            throw IllegalArgumentException("Input bitmap is recycled")
+        }
+        val inputRGBA = Mat()
         Utils.bitmapToMat(bmp, inputRGBA)
         val inputBGR = Mat()
         cvtColor(inputRGBA, inputBGR, COLOR_RGBA2BGR)
