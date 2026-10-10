@@ -62,6 +62,12 @@ class OverlayPopupWebView(private val context: Context) {
     private var maxPopupWidth: Int = 0
     private var maxPopupHeight: Int = 0
     private var textBounds: Rect = Rect()
+    /**
+     * Exclusive bottom Y in container coordinates the popup must not cross.
+     * Used by the Kaku/bubble text strip so content-height resize cannot
+     * slide the WebView down over the strip (which ate character taps).
+     */
+    private var layoutCeiling: Int? = null
 
     // The matched text from the very first lookup in this session; threaded
     // into the JSON payload so the popup can expose a "← original" reset.
@@ -87,7 +93,9 @@ class OverlayPopupWebView(private val context: Context) {
         onRequestRanking: ((Char) -> Unit)? = null,
         onEditOcrInApp: (() -> Unit)? = null,
         onLookupTerm: ((String) -> Unit)? = null,
-        onOpenExternal: ((String) -> Unit)? = null
+        onOpenExternal: ((String) -> Unit)? = null,
+        /** Exclusive bottom Y in [container] coords; popup stays entirely above this. */
+        layoutCeiling: Int? = null
     ) {
         if (entries.isEmpty()) return
 
@@ -103,6 +111,7 @@ class OverlayPopupWebView(private val context: Context) {
         this.maxPopupWidth = maxWidth
         this.maxPopupHeight = maxHeight
         this.textBounds = Rect(textBounds)
+        this.layoutCeiling = layoutCeiling
         this.pendingOriginalMatchedText = originalMatchedText ?: currentMatchedText
 
         // Preload similarity table off the JS thread so requestSimilarKanji is cheap.
@@ -156,16 +165,17 @@ class OverlayPopupWebView(private val context: Context) {
         fun makeCandidate(rawW: Int, rawH: Int, anchorX: Int, anchorY: Int, centerAxis: Char): Candidate {
             val w = rawW.coerceAtMost(maxWidth).coerceAtLeast(0)
             val h = rawH.coerceAtMost(maxHeight).coerceAtLeast(0)
+            // coerceIn throws if max < min (tiny containers / oversized popups).
+            fun clamp(v: Int, lo: Int, hi: Int): Int =
+                if (hi < lo) lo.coerceAtMost(v.coerceAtLeast(0)) else v.coerceIn(lo, hi)
             val x: Int
             val y: Int
             if (centerAxis == 'x') {
-                // Horizontal placement: center on the perpendicular (vertical) axis
-                x = anchorX.coerceIn(edgePad, containerW - w - edgePad)
-                y = (bounds.centerY() - h / 2).coerceIn(edgePad, containerH - h - edgePad)
+                x = clamp(anchorX, edgePad, containerW - w - edgePad)
+                y = clamp(bounds.centerY() - h / 2, edgePad, containerH - h - edgePad)
             } else {
-                // Vertical placement: center on the perpendicular (horizontal) axis
-                x = (bounds.centerX() - w / 2).coerceIn(edgePad, containerW - w - edgePad)
-                y = anchorY.coerceIn(edgePad, containerH - h - edgePad)
+                x = clamp(bounds.centerX() - w / 2, edgePad, containerW - w - edgePad)
+                y = clamp(anchorY, edgePad, containerH - h - edgePad)
             }
             return Candidate(w, h, x, y)
         }
@@ -196,8 +206,32 @@ class OverlayPopupWebView(private val context: Context) {
             centerAxis = 'x'
         ).let { it.copy(x = (bounds.left - margin - it.w).coerceAtLeast(edgePad)) }
 
-        val best = listOf(below, above, right, left).maxByOrNull { it.w.toLong() * it.h.toLong() }
+        var best = listOf(below, above, right, left).maxByOrNull { it.w.toLong() * it.h.toLong() }
             ?: below
+
+        // Keep the popup entirely above [layoutCeiling] (e.g. the text strip).
+        val ceiling = layoutCeiling
+        if (ceiling != null) {
+            val maxBottom = ceiling - edgePad
+            var y = best.y
+            var h = best.h
+            if (y + h > maxBottom) {
+                h = (maxBottom - y).coerceAtLeast(0)
+                if (h < (60 * context.resources.displayMetrics.density).toInt()) {
+                    // Not enough room at this y — shift up.
+                    h = best.h.coerceAtMost((maxBottom - edgePad).coerceAtLeast(0))
+                    y = (maxBottom - h).coerceAtLeast(edgePad)
+                }
+            }
+            // Prefer the vertical center of the free band above the ceiling so
+            // content-height shrinks don't pin the popup against the strip.
+            val bandTop = edgePad
+            val bandBottom = maxBottom
+            if (bandBottom > bandTop && h <= bandBottom - bandTop) {
+                y = bandTop + (bandBottom - bandTop - h) / 2
+            }
+            best = best.copy(y = y, h = h.coerceAtLeast(0), w = best.w.coerceAtMost(maxWidth))
+        }
 
         return FrameLayout.LayoutParams(best.w, best.h).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -340,10 +374,13 @@ class OverlayPopupWebView(private val context: Context) {
 
         val density = context.resources.displayMetrics.density
         val minHeight = (80 * density).toInt()
+        val ceilingCap = layoutCeiling?.let { ceil ->
+            (ceil - 16).coerceAtLeast(minHeight)
+        } ?: Int.MAX_VALUE
         val targetHeight = (contentHeightPx + (8 * density).toInt())
-            .coerceIn(minHeight, maxPopupHeight)
+            .coerceIn(minHeight, minOf(maxPopupHeight, ceilingCap))
 
-        // Re-run smart positioning with the new height
+        // Re-run smart positioning with the new height (still respects layoutCeiling)
         val lp = computeLayoutParams(container, maxPopupWidth, targetHeight, textBounds)
         wv.layoutParams = lp
     }
