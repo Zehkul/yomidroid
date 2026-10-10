@@ -1,5 +1,6 @@
 package com.yomidroid.ocr
 
+import com.yomidroid.BuildConfig
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
@@ -41,6 +42,8 @@ class MangaOcrEngine(
         private const val TAG = "MangaOcrEngine"
         private const val PADDING = 50
         private const val LINE_MARGIN = 10
+        // Crop dumps only in debug builds (never release/CI release APKs).
+        private val DEBUG_DUMP_CROPS = BuildConfig.DEBUG
     }
 
     override suspend fun processImage(bitmap: Bitmap): Result<List<OcrResult>> {
@@ -68,6 +71,57 @@ class MangaOcrEngine(
                 Result.success(results)
             } catch (e: Exception) {
                 Log.e(TAG, "Manga OCR failed: ${e.message}", e)
+                Result.failure(e)
+            }
+        }
+    }
+
+    /**
+     * Recognize a user-selected crop directly — no text detector.
+     * The entire bitmap is treated as a single text region (Kaku-style).
+     * Optional preprocess still runs; the result's bounds cover the full crop.
+     */
+    suspend fun processDirectRegion(bitmap: Bitmap): Result<List<OcrResult>> {
+        return withContext(Dispatchers.Default) {
+            try {
+                if (!isInitialized) initialize()
+                val totalStart = SystemClock.elapsedRealtime()
+
+                val inference = mangaOcrInference
+                    ?: return@withContext Result.failure(IllegalStateException("Manga OCR not initialized"))
+                inference.bilinearScaling =
+                    config.mangaOcrCropScaling == MangaOcrCropScaling.BILINEAR
+
+                val pre = preprocessIfEnabled(bitmap)
+                try {
+                    val recStart = SystemClock.elapsedRealtime()
+                    val text = inference.recognize(pre.bitmap)
+                    val recMs = SystemClock.elapsedRealtime() - recStart
+                    Log.d(
+                        TAG,
+                        "direct-region ms=${SystemClock.elapsedRealtime() - totalStart} " +
+                            "recognize ms=$recMs chars=${text.length} " +
+                            "input=${bitmap.width}x${bitmap.height}"
+                    )
+                    if (text.isBlank()) {
+                        Result.success(emptyList())
+                    } else {
+                        val bounds = Rect(0, 0, bitmap.width, bitmap.height)
+                        Result.success(
+                            listOf(
+                                OcrResult(
+                                    text,
+                                    bounds,
+                                    OcrUtils.synthesizeCharBounds(text, bounds)
+                                )
+                            )
+                        )
+                    }
+                } finally {
+                    if (pre.bitmap !== bitmap) pre.bitmap.recycle()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Manga OCR direct region failed: ${e.message}", e)
                 Result.failure(e)
             }
         }
@@ -104,32 +158,67 @@ class MangaOcrEngine(
 
     private suspend fun detect(preBitmap: Bitmap): List<Rect> {
         val detStart = SystemClock.elapsedRealtime()
-        val rects = when (config.mangaOcrDetector) {
-            MangaOcrDetector.PADDLE_OCR -> detectWithPaddleOcr(preBitmap)
-            MangaOcrDetector.ML_KIT_HYBRID -> detectWithMlKit(preBitmap)
+        val rects = try {
+            when (config.mangaOcrDetector) {
+                MangaOcrDetector.PADDLE_OCR -> {
+                    try {
+                        detectWithPaddleOcr(preBitmap)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "PaddleOCR detect failed, falling back to ML Kit: ${e.message}", e)
+                        detectWithMlKit(preBitmap)
+                    }
+                }
+                MangaOcrDetector.ML_KIT_HYBRID -> detectWithMlKit(preBitmap)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "detect failed: ${e.message}", e)
+            emptyList()
         }
         val detMs = SystemClock.elapsedRealtime() - detStart
         Log.d(TAG, "detect ms=$detMs regions=${rects.size} backend=${config.mangaOcrDetector}")
         return rects
     }
 
+    /**
+     * Run RapidOCR for **boxes only**. Classification/recognition are disabled —
+     * manga-ocr does recognition. OpenCV needs a software ARGB_8888 bitmap.
+     */
     private fun detectWithPaddleOcr(preBitmap: Bitmap): List<Rect> {
         val rapid = rapidEngine ?: return emptyList()
-        val det = rapid.detect(
-            bmp = preBitmap,
-            scaleUp = false,
-            maxSideLen = config.mangaOcrMaxSideLen,
-            padding = PADDING,
-            boxScoreThresh = 0.5f,
-            boxThresh = 0.3f,
-            unClipRatio = 1.6f,
-            doCls = true,
-            mostCls = true
-        )
-        return det.detResults.mapNotNull { d ->
-            val r = pointsToRect(d.points)
-            if (r.width() <= 0 || r.height() <= 0) null else r
+        val bmp = ensureSoftwareArgb8888(preBitmap)
+        try {
+            // OcrEngine is not thread-safe (shared OrtSession / OpenCV Mats).
+            val det = synchronized(rapid) {
+                rapid.detect(
+                    bmp = bmp,
+                    scaleUp = false,
+                    maxSideLen = config.mangaOcrMaxSideLen,
+                    padding = PADDING,
+                    boxScoreThresh = 0.5f,
+                    boxThresh = 0.3f,
+                    unClipRatio = 1.6f,
+                    doCls = false,
+                    mostCls = false
+                )
+            }
+            return det.detResults.mapNotNull { d ->
+                val r = pointsToRect(d.points)
+                if (r.width() <= 0 || r.height() <= 0) null else r
+            }
+        } finally {
+            if (bmp !== preBitmap) bmp.recycle()
         }
+    }
+
+    private fun ensureSoftwareArgb8888(src: Bitmap): Bitmap {
+        if (src.isRecycled) {
+            throw IllegalArgumentException("Bitmap is recycled")
+        }
+        if (src.config == Bitmap.Config.ARGB_8888 && src.isMutable) {
+            return src
+        }
+        return src.copy(Bitmap.Config.ARGB_8888, /* mutable */ true)
+            ?: throw IllegalStateException("Failed to copy bitmap to ARGB_8888")
     }
 
     private suspend fun detectWithMlKit(preBitmap: Bitmap): List<Rect> {
@@ -156,7 +245,9 @@ class MangaOcrEngine(
             Log.d(TAG, "recognize ms=$recMs chars=${text.length}")
             if (text.isBlank()) return@mapNotNull null
 
-            val origBounds = scaleRectDown(expanded, scale, originalBitmap)
+            // Report the detector box, not the padded crop — LINE_MARGIN is only
+            // for recognition input; including it stretched the indicator/grid.
+            val origBounds = scaleRectDown(preRect, scale, originalBitmap)
             OcrResult(text, origBounds, OcrUtils.synthesizeCharBounds(text, origBounds))
         } finally {
             if (crop !== preBitmap) crop.recycle()
@@ -170,10 +261,17 @@ class MangaOcrEngine(
         scale: Float,
         originalBitmap: Bitmap
     ): List<OcrResult> {
-        val clusters = clusterRects(preRects)
-        Log.d(TAG, "clusters=${clusters.size} from rects=${preRects.size}")
+        val cleaned = dropFurigana(preRects)
+        val clusters = clusterIntoBubbles(cleaned)
+        Log.d(
+            TAG,
+            "bubbles=${clusters.size} from rects=${preRects.size} " +
+                "afterFuriganaFilter=${cleaned.size} " +
+                "sizes=${clusters.map { it.size }}"
+        )
 
-        return clusters.flatMap { cluster ->
+        val out = mutableListOf<OcrResult>()
+        for (cluster in clusters) {
             val union = unionRect(cluster)
             val expanded = expand(union, preBitmap)
             val crop = Bitmap.createBitmap(
@@ -183,17 +281,195 @@ class MangaOcrEngine(
                 val recStart = SystemClock.elapsedRealtime()
                 val text = inference.recognize(crop)
                 val recMs = SystemClock.elapsedRealtime() - recStart
-                Log.d(TAG, "recognize ms=$recMs chars=${text.length} linesInCluster=${cluster.size}")
-                if (text.isBlank()) return@flatMap emptyList<OcrResult>()
+                Log.d(
+                    TAG,
+                    "bubble recognize ms=$recMs chars=${text.length} " +
+                        "boxes=${cluster.size} crop=${crop.width}x${crop.height}"
+                )
+                if (text.isBlank()) continue
 
-                splitTextAcrossLines(text, cluster).mapIndexed { i, slice ->
-                    val origBounds = scaleRectDown(cluster[i], scale, originalBitmap)
-                    OcrResult(slice, origBounds, OcrUtils.synthesizeCharBounds(slice, origBounds))
+                val singleColumn = isSingleColumn(cluster)
+                if (singleColumn && cluster.size > 1) {
+                    val ordered = cluster.sortedBy { it.top }
+                    val vertical =
+                        ordered.count { OcrUtils.isVerticalLine(it) } * 2 >= ordered.size
+                    val slices = splitTextAcrossLines(text, ordered, vertical)
+                    if (isSplitReliable(text, ordered, slices)) {
+                        for (i in ordered.indices) {
+                            val slice = slices[i]
+                            if (slice.isBlank()) continue
+                            val origBounds = scaleRectDown(ordered[i], scale, originalBitmap)
+                            out.add(
+                                OcrResult(
+                                    slice,
+                                    origBounds,
+                                    OcrUtils.synthesizeCharBounds(slice, origBounds)
+                                )
+                            )
+                        }
+                        continue
+                    }
                 }
+
+                // Multi-column bubble (or unreliable split): one result for the
+                // whole union — manga-ocr is trained on multi-line bubbles.
+                val origBounds = scaleRectDown(union, scale, originalBitmap)
+                out.add(
+                    OcrResult(text, origBounds, OcrUtils.synthesizeCharBounds(text, origBounds))
+                )
             } finally {
                 if (crop !== preBitmap) crop.recycle()
             }
         }
+        return out
+    }
+
+    /**
+     * Drop small detector boxes that sit beside a clearly larger neighbour —
+     * typical furigana / ruby annotations.
+     */
+    private fun dropFurigana(rects: List<Rect>): List<Rect> {
+        if (rects.size <= 1) return rects
+        return rects.filter { small ->
+            val smallArea = small.width().toLong() * small.height()
+            val isFurigana = rects.any { large ->
+                if (large === small) return@any false
+                val largeArea = large.width().toLong() * large.height()
+                if (largeArea < smallArea * 2L) return@any false
+                if (smallArea > largeArea * 0.45) return@any false
+
+                val vOverlap = minOf(small.bottom, large.bottom) - maxOf(small.top, large.top)
+                val hOverlap = minOf(small.right, large.right) - maxOf(small.left, large.left)
+                val minH = minOf(small.height(), large.height())
+                val minW = minOf(small.width(), large.width())
+
+                val besideHorizontally =
+                    vOverlap > minH * 0.35f && hOverlap < minW * 0.25f
+                val besideVertically =
+                    hOverlap > minW * 0.35f && vOverlap < minH * 0.25f
+
+                besideHorizontally || besideVertically
+            }
+            !isFurigana
+        }
+    }
+
+    /**
+     * Group detector boxes into speech-bubble regions by 2D proximity.
+     * Side-by-side vertical columns inside one bubble merge; distant bubbles do not.
+     */
+    private fun clusterIntoBubbles(rects: List<Rect>): List<List<Rect>> {
+        if (rects.isEmpty()) return emptyList()
+
+        val medianSpan = rects
+            .map { maxOf(it.width(), it.height()) }
+            .sorted()[rects.size / 2]
+            .toFloat()
+            .coerceAtLeast(1f)
+        // ~one character-box of gap still counts as "same bubble".
+        val maxGap = medianSpan * 1.25f
+
+        val groups = mutableListOf<MutableList<Rect>>()
+        val sorted = rects.sortedWith(compareBy({ it.top }, { -it.right }))
+        for (r in sorted) {
+            val match = groups.firstOrNull { g -> g.any { canClusterBubble(it, r, maxGap) } }
+            if (match != null) match.add(r) else groups.add(mutableListOf(r))
+        }
+
+        // Union-find style: merge groups that touch via any member pair.
+        var merged = true
+        while (merged) {
+            merged = false
+            outer@ for (i in groups.indices) {
+                for (j in i + 1 until groups.size) {
+                    val a = groups[i]
+                    val b = groups[j]
+                    if (a.any { ra -> b.any { rb -> canClusterBubble(ra, rb, maxGap) } }) {
+                        a.addAll(b)
+                        groups.removeAt(j)
+                        merged = true
+                        break@outer
+                    }
+                }
+            }
+        }
+
+        return groups.map { g ->
+            val vertical = g.count { OcrUtils.isVerticalLine(it) } * 2 >= g.size
+            if (vertical) {
+                g.sortedWith(compareByDescending<Rect> { it.right }.thenBy { it.top })
+            } else {
+                g.sortedBy { it.top }
+            }
+        }.sortedByDescending { g -> g.maxOf { it.right } }
+    }
+
+    /** True when every box shares roughly the same horizontal centre (one column). */
+    private fun isSingleColumn(boxes: List<Rect>): Boolean {
+        if (boxes.size <= 1) return true
+        val centres = boxes.map { (it.left + it.right) / 2f }
+        val avgW = boxes.map { it.width() }.average().toFloat().coerceAtLeast(1f)
+        val minC = centres.minOrNull() ?: return true
+        val maxC = centres.maxOrNull() ?: return true
+        return (maxC - minC) <= avgW * 0.9f
+    }
+
+    private fun canClusterBubble(a: Rect, b: Rect, maxGap: Float): Boolean {
+        val gapX = when {
+            a.right < b.left -> (b.left - a.right).toFloat()
+            b.right < a.left -> (a.left - b.right).toFloat()
+            else -> 0f
+        }
+        val gapY = when {
+            a.bottom < b.top -> (b.top - a.bottom).toFloat()
+            b.bottom < a.top -> (a.top - b.bottom).toFloat()
+            else -> 0f
+        }
+        return gapX <= maxGap && gapY <= maxGap
+    }
+
+    private fun unionRect(rects: List<Rect>): Rect {
+        val out = Rect(rects[0])
+        for (i in 1 until rects.size) out.union(rects[i])
+        return out
+    }
+
+    /**
+     * Split recognised text across line boxes proportional to span on the
+     * reading axis. Only used for single-column multi-line bubbles.
+     */
+    private fun splitTextAcrossLines(
+        text: String,
+        lines: List<Rect>,
+        vertical: Boolean
+    ): List<String> {
+        if (lines.size <= 1) return listOf(text)
+        val spans = lines.map {
+            if (vertical) it.height().toFloat() else it.width().toFloat()
+        }
+        val total = spans.sum().coerceAtLeast(1f)
+        val out = mutableListOf<String>()
+        var consumed = 0
+        for (i in lines.indices) {
+            val end = if (i == lines.size - 1) text.length
+            else (text.length * spans.take(i + 1).sum() / total).toInt()
+                .coerceIn(consumed, text.length)
+            out.add(text.substring(consumed, end))
+            consumed = end
+        }
+        return out
+    }
+
+    private fun isSplitReliable(
+        text: String,
+        lines: List<Rect>,
+        slices: List<String>
+    ): Boolean {
+        if (lines.size <= 1) return true
+        if (text.length < lines.size) return false
+        if (slices.size != lines.size) return false
+        if (slices.count { it.isBlank() } * 2 > lines.size) return false
+        return true
     }
 
     private fun expand(r: Rect, bitmap: Bitmap): Rect = Rect(
@@ -213,47 +489,6 @@ class MangaOcrEngine(
         )
     }
 
-    private fun unionRect(rects: List<Rect>): Rect {
-        val out = Rect(rects[0])
-        for (i in 1 until rects.size) out.union(rects[i])
-        return out
-    }
-
-    private fun clusterRects(rects: List<Rect>): List<List<Rect>> {
-        val sorted = rects.sortedBy { it.top }
-        val groups = mutableListOf<MutableList<Rect>>()
-        for (r in sorted) {
-            val match = groups.firstOrNull { g -> g.any { canCluster(it, r) } }
-            if (match != null) match.add(r) else groups.add(mutableListOf(r))
-        }
-        return groups.map { g -> g.sortedBy { it.top } }
-    }
-
-    private fun canCluster(a: Rect, b: Rect): Boolean {
-        val overlap = (minOf(a.right, b.right) - maxOf(a.left, b.left))
-        val narrower = minOf(a.width(), b.width())
-        if (narrower <= 0 || overlap < narrower * 0.3f) return false
-        val gap = if (a.bottom <= b.top) b.top - a.bottom
-        else if (b.bottom <= a.top) a.top - b.bottom
-        else 0
-        return gap <= maxOf(a.height(), b.height()) * 1.5f
-    }
-
-    private fun splitTextAcrossLines(text: String, lines: List<Rect>): List<String> {
-        if (lines.size <= 1) return listOf(text)
-        val widths = lines.map { it.width().toFloat() }
-        val total = widths.sum().coerceAtLeast(1f)
-        val out = mutableListOf<String>()
-        var consumed = 0
-        for (i in lines.indices) {
-            val end = if (i == lines.size - 1) text.length
-            else (text.length * widths.take(i + 1).sum() / total).toInt().coerceIn(consumed, text.length)
-            out.add(text.substring(consumed, end))
-            consumed = end
-        }
-        return out
-    }
-
     private fun initialize() {
         val modelManager = MangaOcrModelManager.getInstance(context)
         if (!modelManager.isModelReady()) {
@@ -269,6 +504,7 @@ class MangaOcrEngine(
             vocabPath = modelManager.getVocabPath(),
             bilinearScaling = config.mangaOcrCropScaling == MangaOcrCropScaling.BILINEAR
         )
+        if (DEBUG_DUMP_CROPS) MangaOcrInference.debugDumpDir = context.getExternalFilesDir("ocr_dump")
         isInitialized = true
         Log.d(TAG, "MangaOcrEngine initialized successfully")
     }
