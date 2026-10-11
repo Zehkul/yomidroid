@@ -68,19 +68,39 @@ android {
     // Required for a signed APK:
     //   YOMIDROID_KEYSTORE_PATH, YOMIDROID_KEYSTORE_PASSWORD,
     //   YOMIDROID_KEY_ALIAS, YOMIDROID_KEY_PASSWORD
+    //
+    // Relative paths are resolved against the *repo root* first (rootProject),
+    // then this module — so YOMIDROID_KEYSTORE_PATH=./yomidroid-release.jks works
+    // when the JKS sits next to settings.gradle.kts.
     signingConfigs {
         create("release") {
-            val ksPath = System.getenv("YOMIDROID_KEYSTORE_PATH")
-                ?: (project.findProperty("YOMIDROID_KEYSTORE_PATH") as String?)
-            if (!ksPath.isNullOrBlank()) {
-                storeFile = file(ksPath)
-                storePassword = System.getenv("YOMIDROID_KEYSTORE_PASSWORD")
-                    ?: (project.findProperty("YOMIDROID_KEYSTORE_PASSWORD") as String?)
-                keyAlias = System.getenv("YOMIDROID_KEY_ALIAS")
-                    ?: (project.findProperty("YOMIDROID_KEY_ALIAS") as String?)
-                    ?: "yomidroid"
-                keyPassword = System.getenv("YOMIDROID_KEY_PASSWORD")
-                    ?: (project.findProperty("YOMIDROID_KEY_PASSWORD") as String?)
+            fun envOrProp(name: String): String? =
+                System.getenv(name) ?: (project.findProperty(name) as String?)
+
+            val ksPathRaw = envOrProp("YOMIDROID_KEYSTORE_PATH")
+            if (!ksPathRaw.isNullOrBlank()) {
+                val asGiven = file(ksPathRaw)
+                val fromRoot = rootProject.file(ksPathRaw)
+                val fromModule = project.file(ksPathRaw)
+                val resolved = when {
+                    asGiven.isAbsolute && asGiven.exists() -> asGiven
+                    fromRoot.exists() -> fromRoot
+                    fromModule.exists() -> fromModule
+                    asGiven.isAbsolute -> asGiven // let Gradle report the missing absolute path
+                    else -> fromRoot // default: repo-root relative for clearer errors
+                }
+                if (!resolved.exists()) {
+                    throw GradleException(
+                        "YOMIDROID_KEYSTORE_PATH='$ksPathRaw' not found " +
+                            "(tried ${fromRoot.absolutePath} and ${fromModule.absolutePath})"
+                    )
+                }
+                storeFile = resolved
+                storePassword = envOrProp("YOMIDROID_KEYSTORE_PASSWORD")
+                    ?: throw GradleException("YOMIDROID_KEYSTORE_PASSWORD is required when signing release")
+                keyAlias = envOrProp("YOMIDROID_KEY_ALIAS") ?: "yomidroid"
+                keyPassword = envOrProp("YOMIDROID_KEY_PASSWORD")
+                    ?: throw GradleException("YOMIDROID_KEY_PASSWORD is required when signing release")
             }
         }
     }
