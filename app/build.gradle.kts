@@ -136,6 +136,14 @@ android {
         buildConfig = true
     }
 
+    // AnkiDroid's API AAR ships a lint check that forbids System.currentTimeMillis()
+    // in favor of Collection.getTime(). That API only exists inside AnkiDroid itself;
+    // it makes lintVitalRelease fail for every legitimate clock use in this app.
+    // assembleDebug never ran lintVital, which is why this only showed up on release.
+    lint {
+        disable += "DirectSystemCurrentTimeMillisUsage"
+    }
+
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.5"
     }
