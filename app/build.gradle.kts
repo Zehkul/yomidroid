@@ -64,6 +64,27 @@ android {
         }
     }
 
+    // Release signing from env (CI) or optional local path. Never commit the keystore.
+    // Required for a signed APK:
+    //   YOMIDROID_KEYSTORE_PATH, YOMIDROID_KEYSTORE_PASSWORD,
+    //   YOMIDROID_KEY_ALIAS, YOMIDROID_KEY_PASSWORD
+    signingConfigs {
+        create("release") {
+            val ksPath = System.getenv("YOMIDROID_KEYSTORE_PATH")
+                ?: (project.findProperty("YOMIDROID_KEYSTORE_PATH") as String?)
+            if (!ksPath.isNullOrBlank()) {
+                storeFile = file(ksPath)
+                storePassword = System.getenv("YOMIDROID_KEYSTORE_PASSWORD")
+                    ?: (project.findProperty("YOMIDROID_KEYSTORE_PASSWORD") as String?)
+                keyAlias = System.getenv("YOMIDROID_KEY_ALIAS")
+                    ?: (project.findProperty("YOMIDROID_KEY_ALIAS") as String?)
+                    ?: "yomidroid"
+                keyPassword = System.getenv("YOMIDROID_KEY_PASSWORD")
+                    ?: (project.findProperty("YOMIDROID_KEY_PASSWORD") as String?)
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -71,6 +92,12 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Sign only when a keystore path was provided; otherwise produce an
+            // unsigned release APK (useful for local smoke tests).
+            val releaseSigning = signingConfigs.getByName("release")
+            if (releaseSigning.storeFile != null) {
+                signingConfig = releaseSigning
+            }
         }
     }
 
@@ -85,6 +112,8 @@ android {
 
     buildFeatures {
         compose = true
+        // BuildConfig.DEBUG gates ocr crop dumps (never enabled in release).
+        buildConfig = true
     }
 
     composeOptions {
