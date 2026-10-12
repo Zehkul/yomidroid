@@ -246,11 +246,34 @@ private fun MangaOcrTuningCard(
 
             Spacer(Modifier.height(16.dp))
             ToggleRow(
+                label = "Selection rectangle (Kaku-style)",
+                description = "Persistent movable box; scans on move/resize. Tappable text " +
+                    "panel for word lookup. Mutually exclusive with whole-bubble.",
+                checked = config.mangaOcrSelectionRect,
+                onChange = { enabled ->
+                    onChange(
+                        config.copy(
+                            mangaOcrSelectionRect = enabled,
+                            mangaOcrWholeBubbleMode = if (enabled) false else config.mangaOcrWholeBubbleMode
+                        )
+                    )
+                }
+            )
+
+            Spacer(Modifier.height(8.dp))
+            ToggleRow(
                 label = "Whole-bubble recognition",
-                description = "Cluster lines into bubbles. Faster + matches Manga109 training. " +
-                    "Loses per-line tap precision in coupled mode.",
+                description = "Cluster into bubbles; tap a bubble outline to open its text. " +
+                    "Mutually exclusive with selection rectangle.",
                 checked = config.mangaOcrWholeBubbleMode,
-                onChange = { onChange(config.copy(mangaOcrWholeBubbleMode = it)) }
+                onChange = { enabled ->
+                    onChange(
+                        config.copy(
+                            mangaOcrWholeBubbleMode = enabled,
+                            mangaOcrSelectionRect = if (enabled) false else config.mangaOcrSelectionRect
+                        )
+                    )
+                }
             )
 
             Spacer(Modifier.height(8.dp))
