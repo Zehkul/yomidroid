@@ -11,7 +11,6 @@ import com.orhanobut.logger.Logger
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.android.Utils.matToBitmap
-import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.Rect
 import org.opencv.core.TickMeter
@@ -82,7 +81,11 @@ class OcrEngine(context: Context) : Closeable {
         Logger.i("Parameter: scaleUp($scaleUp), maxSideLen($maxSideLen), padding($padding),boxScoreThresh($boxScoreThresh),boxThresh($boxThresh),unClipRatio($unClipRatio),doCls($doCls),mostCls($mostCls)")
 
         Logger.i("---------- step: input Bitmap -> Mat(RGBA) -> Mat(BGR) ----------")
-        val inputRGBA = Mat(bmp.width, bmp.height, CvType.CV_8UC4)
+        // Empty Mat: Utils.bitmapToMat allocates rows=height, cols=width.
+        if (bmp.isRecycled) {
+            throw IllegalArgumentException("Input bitmap is recycled")
+        }
+        val inputRGBA = Mat()
         Utils.bitmapToMat(bmp, inputRGBA)
         val inputBGR = Mat()
         cvtColor(inputRGBA, inputBGR, COLOR_RGBA2BGR)
