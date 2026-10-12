@@ -57,9 +57,10 @@ class MangaOcrInference(
     /**
      * Recognize text from a cropped bitmap region.
      * @param bitmap Cropped text region bitmap
+     * @param isActive return false to stop decoding early (cooperative cancel)
      * @return Recognized text string
      */
-    fun recognize(bitmap: Bitmap): String {
+    fun recognize(bitmap: Bitmap, isActive: () -> Boolean = { true }): String {
         val inputTensor = preprocessImage(bitmap)
         var encoderOutput: OnnxTensor? = null
         try {
@@ -72,6 +73,10 @@ class MangaOcrInference(
             val tokenIds = mutableListOf(MangaOcrTokenizer.CLS_ID)
             var steps = 0
             for (step in 0 until MAX_TOKENS) {
+                if (!isActive()) {
+                    Log.d(TAG, "recognize cancelled after $step decoder steps")
+                    break
+                }
                 val nextToken = decoderStep(tokenIds, encoderOutput)
                 steps = step + 1
                 if (nextToken == MangaOcrTokenizer.SEP_ID) break
@@ -86,6 +91,7 @@ class MangaOcrInference(
             encoderOutput?.close()
         }
     }
+
 
     private fun decoderStep(tokenIds: List<Int>, encoderHidden: OnnxTensor): Int {
         val idsArray = tokenIds.map { it.toLong() }.toLongArray()
