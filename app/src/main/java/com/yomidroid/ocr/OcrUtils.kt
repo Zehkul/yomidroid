@@ -5,12 +5,16 @@ import android.graphics.Rect
 object OcrUtils {
 
     /**
-     * Synthesize per-character bounding boxes by distributing [lineBounds] width
-     * proportionally using Unicode-aware character widths.
+     * Synthesize per-character bounding boxes by distributing [lineBounds]
+     * along the reading axis using Unicode-aware character weights.
+     *
+     * Horizontal lines (width ≥ height / 1.5): split **width**, full height.
+     * Vertical columns (height > width * 1.5): split **height**, full width.
+     * Matches the service vertical-text heuristic (height-dominant boxes).
      *
      * Fullwidth characters (CJK ideographs, kana, fullwidth forms) get weight 1.0.
      * Halfwidth characters (ASCII, digits, halfwidth katakana) get weight 0.5.
-     * Last character snaps to [lineBounds].right to avoid rounding gaps.
+     * Last character snaps to the far edge to avoid rounding gaps.
      */
     fun synthesizeCharBounds(text: String, lineBounds: Rect): List<Rect> {
         if (text.isEmpty()) return emptyList()
@@ -19,19 +23,41 @@ object OcrUtils {
         val totalWeight = weights.sum()
         if (totalWeight <= 0f) return emptyList()
 
-        val totalWidth = lineBounds.width().toFloat()
-        var cumulative = 0f
+        val vertical = isVerticalLine(lineBounds)
 
-        return text.indices.map { i ->
-            val left = (lineBounds.left + cumulative / totalWeight * totalWidth).toInt()
-            cumulative += weights[i]
-            val right = if (i == text.length - 1) {
-                lineBounds.right
-            } else {
-                (lineBounds.left + cumulative / totalWeight * totalWidth).toInt()
+        return if (vertical) {
+            val totalHeight = lineBounds.height().toFloat()
+            var cumulative = 0f
+            text.indices.map { i ->
+                val top = (lineBounds.top + cumulative / totalWeight * totalHeight).toInt()
+                cumulative += weights[i]
+                val bottom = if (i == text.length - 1) {
+                    lineBounds.bottom
+                } else {
+                    (lineBounds.top + cumulative / totalWeight * totalHeight).toInt()
+                }
+                Rect(lineBounds.left, top, lineBounds.right, bottom)
             }
-            Rect(left, lineBounds.top, right, lineBounds.bottom)
+        } else {
+            val totalWidth = lineBounds.width().toFloat()
+            var cumulative = 0f
+            text.indices.map { i ->
+                val left = (lineBounds.left + cumulative / totalWeight * totalWidth).toInt()
+                cumulative += weights[i]
+                val right = if (i == text.length - 1) {
+                    lineBounds.right
+                } else {
+                    (lineBounds.left + cumulative / totalWeight * totalWidth).toInt()
+                }
+                Rect(left, lineBounds.top, right, lineBounds.bottom)
+            }
         }
+    }
+
+    /** Height-dominant box: treat as a vertical text column. */
+    fun isVerticalLine(lineBounds: Rect): Boolean {
+        val w = lineBounds.width().coerceAtLeast(1).toFloat()
+        return lineBounds.height().toFloat() / w > 1.5f
     }
 
     private fun charWidth(c: Char): Float {

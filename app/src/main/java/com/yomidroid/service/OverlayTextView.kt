@@ -16,6 +16,7 @@ import com.yomidroid.R
 import com.yomidroid.dictionary.DictionaryEntry
 import com.yomidroid.ocr.CharMapping
 import com.yomidroid.ocr.OcrResult
+import com.yomidroid.ocr.OcrUtils
 import com.yomidroid.ocr.UnifiedOcrContext
 
 /**
@@ -1111,10 +1112,14 @@ class OverlayTextView(
             }
         }
 
-        // Only accept if within reasonable distance (1.5x the average char width)
+        // Only accept if within reasonable distance (1.5x the average char
+        // span along the reading axis — width for horizontal, height for vertical).
         if (bestIndex >= 0 && result.charBounds.isNotEmpty()) {
-            val avgWidth = result.charBounds.sumOf { (it.right - it.left).toDouble() }.toFloat() / result.charBounds.size
-            val maxAcceptDist = avgWidth * 1.5f
+            val vertical = OcrUtils.isVerticalLine(result.lineBounds)
+            val avgSpan = result.charBounds.map {
+                if (vertical) (it.bottom - it.top).toDouble() else (it.right - it.left).toDouble()
+            }.average().toFloat()
+            val maxAcceptDist = avgSpan * 1.5f
             if (kotlin.math.sqrt(bestDist) <= maxAcceptDist) {
                 return bestIndex
             }
