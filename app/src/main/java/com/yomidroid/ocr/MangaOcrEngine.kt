@@ -11,7 +11,12 @@ import com.yomidroid.config.MangaOcrCropScaling
 import com.yomidroid.config.MangaOcrDetector
 import com.yomidroid.config.OcrConfig
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.Job
 
 /**
  * OCR engine wrapping the manga-ocr ONNX recognizer behind a configurable
@@ -36,6 +41,8 @@ class MangaOcrEngine(
     private var mlKitEngine: MlKitOcrEngine? = null
     private var mangaOcrInference: MangaOcrInference? = null
     private var isInitialized = false
+    /** Serialize recognition so aborted scans cannot pile up on the decoder. */
+    private val recognizeMutex = Mutex()
 
     companion object {
         private const val TAG = "MangaOcrEngine"
@@ -68,6 +75,65 @@ class MangaOcrEngine(
                 Result.success(results)
             } catch (e: Exception) {
                 Log.e(TAG, "Manga OCR failed: ${e.message}", e)
+                Result.failure(e)
+            }
+        }
+    }
+
+    /**
+     * Recognize a user-selected crop directly — no text detector.
+     * The entire bitmap is treated as a single text region (Kaku-style).
+     * Optional preprocess still runs; the result's bounds cover the full crop.
+     */
+    suspend fun processDirectRegion(bitmap: Bitmap): Result<List<OcrResult>> {
+        return withContext(Dispatchers.Default) {
+            try {
+                if (!isInitialized) initialize()
+                val totalStart = SystemClock.elapsedRealtime()
+
+                val inference = mangaOcrInference
+                    ?: return@withContext Result.failure(IllegalStateException("Manga OCR not initialized"))
+                inference.bilinearScaling =
+                    config.mangaOcrCropScaling == MangaOcrCropScaling.BILINEAR
+
+                val pre = preprocessIfEnabled(bitmap)
+                try {
+                    ensureActive()
+                    val job = coroutineContext[Job]
+                    val recStart = SystemClock.elapsedRealtime()
+                    val text = recognizeMutex.withLock {
+                        ensureActive()
+                        inference.recognize(pre.bitmap) { job?.isActive != false }
+                    }
+                    ensureActive()
+                    val recMs = SystemClock.elapsedRealtime() - recStart
+                    Log.d(
+                        TAG,
+                        "direct-region ms=${SystemClock.elapsedRealtime() - totalStart} " +
+                            "recognize ms=$recMs chars=${text.length} " +
+                            "input=${bitmap.width}x${bitmap.height}"
+                    )
+                    if (text.isBlank()) {
+                        Result.success(emptyList())
+                    } else {
+                        val bounds = Rect(0, 0, bitmap.width, bitmap.height)
+                        Result.success(
+                            listOf(
+                                OcrResult(
+                                    text,
+                                    bounds,
+                                    OcrUtils.synthesizeCharBounds(text, bounds)
+                                )
+                            )
+                        )
+                    }
+                } finally {
+                    if (pre.bitmap !== bitmap) pre.bitmap.recycle()
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Manga OCR direct region failed: ${e.message}", e)
                 Result.failure(e)
             }
         }
@@ -211,10 +277,17 @@ class MangaOcrEngine(
         scale: Float,
         originalBitmap: Bitmap
     ): List<OcrResult> {
-        val clusters = clusterRects(preRects)
-        Log.d(TAG, "clusters=${clusters.size} from rects=${preRects.size}")
+        val cleaned = dropFurigana(preRects)
+        val clusters = clusterIntoBubbles(cleaned)
+        Log.d(
+            TAG,
+            "bubbles=${clusters.size} from rects=${preRects.size} " +
+                "afterFuriganaFilter=${cleaned.size} " +
+                "sizes=${clusters.map { it.size }}"
+        )
 
-        return clusters.flatMap { cluster ->
+        val out = mutableListOf<OcrResult>()
+        for (cluster in clusters) {
             val union = unionRect(cluster)
             val expanded = expand(union, preBitmap)
             val crop = Bitmap.createBitmap(
@@ -224,17 +297,132 @@ class MangaOcrEngine(
                 val recStart = SystemClock.elapsedRealtime()
                 val text = inference.recognize(crop)
                 val recMs = SystemClock.elapsedRealtime() - recStart
-                Log.d(TAG, "recognize ms=$recMs chars=${text.length} linesInCluster=${cluster.size}")
-                if (text.isBlank()) return@flatMap emptyList<OcrResult>()
+                Log.d(
+                    TAG,
+                    "bubble recognize ms=$recMs chars=${text.length} " +
+                        "boxes=${cluster.size} crop=${crop.width}x${crop.height}"
+                )
+                if (text.isBlank()) continue
 
-                splitTextAcrossLines(text, cluster).mapIndexed { i, slice ->
-                    val origBounds = scaleRectDown(cluster[i], scale, originalBitmap)
-                    OcrResult(slice, origBounds, OcrUtils.synthesizeCharBounds(slice, origBounds))
-                }
+                // One OcrResult per bubble. Per-line slicing was for char-grid
+                // hit-testing; BubbleHitOverlay looks up whole-bubble text.
+                val origBounds = scaleRectDown(union, scale, originalBitmap)
+                out.add(
+                    OcrResult(text, origBounds, OcrUtils.synthesizeCharBounds(text, origBounds))
+                )
             } finally {
                 if (crop !== preBitmap) crop.recycle()
             }
         }
+        return out
+    }
+
+    /**
+     * Drop small detector boxes that sit beside a clearly larger neighbour —
+     * typical furigana / ruby annotations.
+     */
+    private fun dropFurigana(rects: List<Rect>): List<Rect> {
+        if (rects.size <= 1) return rects
+        return rects.filter { small ->
+            val smallThick = minOf(small.width(), small.height()).toFloat()
+            val isFurigana = rects.any { large ->
+                if (large === small) return@any false
+                val largeThick = minOf(large.width(), large.height()).toFloat()
+                if (largeThick < 1f || smallThick > largeThick * 0.6f) return@any false
+
+                val vOverlap = minOf(small.bottom, large.bottom) - maxOf(small.top, large.top)
+                val hOverlap = minOf(small.right, large.right) - maxOf(small.left, large.left)
+                val vGap = when {
+                    small.bottom <= large.top -> large.top - small.bottom
+                    large.bottom <= small.top -> small.top - large.bottom
+                    else -> 0
+                }
+                val hGap = when {
+                    small.right <= large.left -> large.left - small.right
+                    large.right <= small.left -> small.left - large.right
+                    else -> 0
+                }
+                val besideHorizontally =
+                    hGap >= 0 && hGap < largeThick * 0.75f &&
+                        vOverlap > minOf(small.height(), large.height()) * 0.4f
+                val besideVertically =
+                    vGap >= 0 && vGap < largeThick * 0.75f &&
+                        hOverlap > minOf(small.width(), large.width()) * 0.4f
+                besideHorizontally || besideVertically
+            }
+            !isFurigana
+        }
+    }
+
+    /**
+     * Group detector boxes into speech-bubble regions by 2D proximity.
+     * Side-by-side vertical columns inside one bubble merge; distant bubbles do not.
+     */
+    private fun clusterIntoBubbles(rects: List<Rect>): List<List<Rect>> {
+        if (rects.isEmpty()) return emptyList()
+
+        // Cross-axis thickness ≈ one character, not the long side of a line.
+        val medianSpan = rects
+            .map { minOf(it.width(), it.height()) }
+            .sorted()[rects.size / 2]
+            .toFloat()
+            .coerceAtLeast(1f)
+        // ~one character of gap still counts as "same bubble".
+        val maxGap = medianSpan * 1.25f
+
+        val groups = mutableListOf<MutableList<Rect>>()
+        val sorted = rects.sortedWith(compareBy({ it.top }, { -it.right }))
+        for (r in sorted) {
+            val match = groups.firstOrNull { g -> g.any { canClusterBubble(it, r, maxGap) } }
+            if (match != null) match.add(r) else groups.add(mutableListOf(r))
+        }
+
+        // Union-find style: merge groups that touch via any member pair.
+        var merged = true
+        while (merged) {
+            merged = false
+            outer@ for (i in groups.indices) {
+                for (j in i + 1 until groups.size) {
+                    val a = groups[i]
+                    val b = groups[j]
+                    if (a.any { ra -> b.any { rb -> canClusterBubble(ra, rb, maxGap) } }) {
+                        a.addAll(b)
+                        groups.removeAt(j)
+                        merged = true
+                        break@outer
+                    }
+                }
+            }
+        }
+
+        return groups.map { g ->
+            val vertical = g.count { OcrUtils.isVerticalLine(it) } * 2 >= g.size
+            if (vertical) {
+                g.sortedWith(compareByDescending<Rect> { it.right }.thenBy { it.top })
+            } else {
+                g.sortedBy { it.top }
+            }
+        }.sortedByDescending { g -> g.maxOf { it.right } }
+    }
+
+    private fun canClusterBubble(a: Rect, b: Rect, maxGap: Float): Boolean {
+        val gapX = when {
+            a.right < b.left -> (b.left - a.right).toFloat()
+            b.right < a.left -> (a.left - b.right).toFloat()
+            else -> 0f
+        }
+        val gapY = when {
+            a.bottom < b.top -> (b.top - a.bottom).toFloat()
+            b.bottom < a.top -> (a.top - b.bottom).toFloat()
+            else -> 0f
+        }
+        return gapX <= maxGap && gapY <= maxGap
+    }
+
+    private fun unionRect(rects: List<Rect>): Rect {
+        val out = Rect(rects[0])
+        for (i in 1 until rects.size) out.union(rects[i])
+        return out
     }
 
     private fun expand(r: Rect, bitmap: Bitmap): Rect = Rect(
@@ -252,47 +440,6 @@ class MangaOcrEngine(
             (r.right / scale).toInt().coerceIn(0, original.width),
             (r.bottom / scale).toInt().coerceIn(0, original.height)
         )
-    }
-
-    private fun unionRect(rects: List<Rect>): Rect {
-        val out = Rect(rects[0])
-        for (i in 1 until rects.size) out.union(rects[i])
-        return out
-    }
-
-    private fun clusterRects(rects: List<Rect>): List<List<Rect>> {
-        val sorted = rects.sortedBy { it.top }
-        val groups = mutableListOf<MutableList<Rect>>()
-        for (r in sorted) {
-            val match = groups.firstOrNull { g -> g.any { canCluster(it, r) } }
-            if (match != null) match.add(r) else groups.add(mutableListOf(r))
-        }
-        return groups.map { g -> g.sortedBy { it.top } }
-    }
-
-    private fun canCluster(a: Rect, b: Rect): Boolean {
-        val overlap = (minOf(a.right, b.right) - maxOf(a.left, b.left))
-        val narrower = minOf(a.width(), b.width())
-        if (narrower <= 0 || overlap < narrower * 0.3f) return false
-        val gap = if (a.bottom <= b.top) b.top - a.bottom
-        else if (b.bottom <= a.top) a.top - b.bottom
-        else 0
-        return gap <= maxOf(a.height(), b.height()) * 1.5f
-    }
-
-    private fun splitTextAcrossLines(text: String, lines: List<Rect>): List<String> {
-        if (lines.size <= 1) return listOf(text)
-        val widths = lines.map { it.width().toFloat() }
-        val total = widths.sum().coerceAtLeast(1f)
-        val out = mutableListOf<String>()
-        var consumed = 0
-        for (i in lines.indices) {
-            val end = if (i == lines.size - 1) text.length
-            else (text.length * widths.take(i + 1).sum() / total).toInt().coerceIn(consumed, text.length)
-            out.add(text.substring(consumed, end))
-            consumed = end
-        }
-        return out
     }
 
     private fun initialize() {
