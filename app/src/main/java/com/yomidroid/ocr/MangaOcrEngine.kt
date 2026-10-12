@@ -104,32 +104,71 @@ class MangaOcrEngine(
 
     private suspend fun detect(preBitmap: Bitmap): List<Rect> {
         val detStart = SystemClock.elapsedRealtime()
-        val rects = when (config.mangaOcrDetector) {
-            MangaOcrDetector.PADDLE_OCR -> detectWithPaddleOcr(preBitmap)
-            MangaOcrDetector.ML_KIT_HYBRID -> detectWithMlKit(preBitmap)
+        val rects = try {
+            when (config.mangaOcrDetector) {
+                MangaOcrDetector.PADDLE_OCR -> {
+                    try {
+                        detectWithPaddleOcr(preBitmap)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "PaddleOCR detect failed, falling back to ML Kit: ${e.message}", e)
+                        detectWithMlKit(preBitmap)
+                    }
+                }
+                MangaOcrDetector.ML_KIT_HYBRID -> detectWithMlKit(preBitmap)
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "detect failed: ${e.message}", e)
+            emptyList()
         }
         val detMs = SystemClock.elapsedRealtime() - detStart
         Log.d(TAG, "detect ms=$detMs regions=${rects.size} backend=${config.mangaOcrDetector}")
         return rects
     }
 
+    /**
+     * Paddle detection returns boxes only (no recognition). Recognition is always
+     * done by manga-ocr downstream.
+     */
     private fun detectWithPaddleOcr(preBitmap: Bitmap): List<Rect> {
         val rapid = rapidEngine ?: return emptyList()
-        val det = rapid.detect(
-            bmp = preBitmap,
-            scaleUp = false,
-            maxSideLen = config.mangaOcrMaxSideLen,
-            padding = PADDING,
-            boxScoreThresh = 0.5f,
-            boxThresh = 0.3f,
-            unClipRatio = 1.6f,
-            doCls = true,
-            mostCls = true
-        )
-        return det.detResults.mapNotNull { d ->
-            val r = pointsToRect(d.points)
-            if (r.width() <= 0 || r.height() <= 0) null else r
+        // Hardware / non-ARGB frames crash or mis-detect in the native pipeline.
+        val bmp = ensureSoftwareArgb8888(preBitmap)
+        try {
+            // OcrEngine is not thread-safe; serialize native detect calls.
+            val det = synchronized(rapid) {
+                rapid.detect(
+                    bmp = bmp,
+                    scaleUp = false,
+                    maxSideLen = config.mangaOcrMaxSideLen,
+                    padding = PADDING,
+                    boxScoreThresh = 0.5f,
+                    boxThresh = 0.3f,
+                    unClipRatio = 1.6f,
+                    doCls = false,
+                    mostCls = false
+                )
+            }
+            return det.detResults.mapNotNull { d ->
+                val r = pointsToRect(d.points)
+                if (r.width() <= 0 || r.height() <= 0) null else r
+            }
+        } finally {
+            if (bmp !== preBitmap) bmp.recycle()
         }
+    }
+
+    private fun ensureSoftwareArgb8888(src: Bitmap): Bitmap {
+        if (src.isRecycled) {
+            throw IllegalArgumentException("Bitmap is recycled")
+        }
+        // Hardware bitmaps need a software copy; already-ARGB software frames are fine.
+        if (src.config == Bitmap.Config.ARGB_8888) {
+            return src
+        }
+        return src.copy(Bitmap.Config.ARGB_8888, /* mutable */ true)
+            ?: throw IllegalStateException("Failed to copy bitmap to ARGB_8888")
     }
 
     private suspend fun detectWithMlKit(preBitmap: Bitmap): List<Rect> {
@@ -156,7 +195,9 @@ class MangaOcrEngine(
             Log.d(TAG, "recognize ms=$recMs chars=${text.length}")
             if (text.isBlank()) return@mapNotNull null
 
-            val origBounds = scaleRectDown(expanded, scale, originalBitmap)
+            // Report the detector box, not the padded crop — LINE_MARGIN is only
+            // for recognition input; including it stretched the indicator/grid.
+            val origBounds = scaleRectDown(preRect, scale, originalBitmap)
             OcrResult(text, origBounds, OcrUtils.synthesizeCharBounds(text, origBounds))
         } finally {
             if (crop !== preBitmap) crop.recycle()
